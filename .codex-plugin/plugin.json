@@ -1,0 +1,23 @@
+{
+  "name": "codex-sol-fusion",
+  "version": "0.1.0",
+  "description": "Model-aware Codex orchestration with Sol/Luna routing and ledger guards.",
+  "author": {
+    "name": "Yusuf"
+  },
+  "license": "MIT",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Sol Fusion",
+    "shortDescription": "Route Codex work between Sol and Luna with guarded orchestration.",
+    "longDescription": "Adds model-aware Sol/Luna workflow guidance, proportional ledger guards, and independent verification roles.",
+    "developerName": "Yusuf",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "defaultPrompt": [
+      "Run this task with Sol-led orchestration and Luna workers.",
+      "Use Luna for bounded work and Sol for judgment and verification.",
+      "Audit the current workflow ledger and close verified items."
+    ]
+  }
+}

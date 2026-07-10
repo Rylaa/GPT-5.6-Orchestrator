@@ -1,0 +1,7 @@
+interface:
+  display_name: "Codex Sol Fusion"
+  short_description: "Route bounded work to Luna and judgment to Sol."
+  default_prompt: "Run this task with Sol/Luna role separation and ledger-backed verification."
+
+policy:
+  allow_implicit_invocation: false
