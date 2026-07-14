@@ -1,9 +1,10 @@
-Codex Sol Fusion
+GPT-5.6 Orchestrator
 Copyright (c) 2026 Yusuf
 
 This project is inspired by fable5-orchestrator by Rylaa:
 https://github.com/Rylaa/fable5-orchestrator
 
 fable5-orchestrator is distributed under the MIT License. The orchestration
-concepts were adapted for Codex's native plugin, hook, skill, and agent-profile
-interfaces; Claude-specific code and lifecycle assumptions were not copied.
+concepts were adapted for Codex's plugin, hook, skill, agent-profile, and
+background subagent interfaces; Claude-specific code and lifecycle assumptions
+were not copied.

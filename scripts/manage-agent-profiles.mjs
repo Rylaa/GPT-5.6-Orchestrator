@@ -15,13 +15,30 @@ import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 export const AGENT_PROFILE_FILES = Object.freeze([
+  'orchestrator-luna-gatherer.toml',
+  'orchestrator-luna-worker.toml',
+  'orchestrator-luna-reviewer.toml',
+  'orchestrator-terra-explorer.toml',
+  'orchestrator-terra-worker.toml',
+  'orchestrator-terra-reviewer.toml',
+  'orchestrator-sol-specialist.toml',
+  'orchestrator-sol-verifier.toml',
+])
+
+export const LEGACY_AGENT_PROFILE_FILES = Object.freeze([
   'csf-luna-gatherer.toml',
   'csf-luna-worker.toml',
   'csf-luna-reviewer.toml',
+  'csf-terra-explorer.toml',
+  'csf-terra-worker.toml',
+  'csf-terra-reviewer.toml',
+  'csf-sol-judge.toml',
+  'csf-sol-specialist.toml',
   'csf-sol-verifier.toml',
 ])
 
-const MANAGED_MARKER = '# Managed by codex-sol-fusion.'
+const MANAGED_MARKER = '# Managed by gpt-5-6-orchestrator.'
+const LEGACY_MANAGED_MARKER = '# Managed by codex-sol-fusion.'
 
 async function optionalStat(targetPath) {
   try {
@@ -77,7 +94,7 @@ async function writeAtomic(targetPath, content) {
 
 export async function installAgentProfiles({ codexHome, pluginRoot }) {
   const agentsDir = await resolveAgentDirectory(codexHome, { create: true })
-  const outcome = { installed: [], updated: [], unchanged: [] }
+  const outcome = { installed: [], updated: [], unchanged: [], removedLegacy: [], skippedLegacy: [] }
 
   for (const filename of AGENT_PROFILE_FILES) {
     const { sourcePath, targetPath } = profilePaths({ codexHome, pluginRoot, filename })
@@ -107,6 +124,23 @@ export async function installAgentProfiles({ codexHome, pluginRoot }) {
     }
     await writeAtomic(targetPath, source)
     outcome.updated.push(filename)
+  }
+
+  for (const filename of LEGACY_AGENT_PROFILE_FILES) {
+    const targetPath = path.join(agentsDir, filename)
+    const targetInfo = await optionalStat(targetPath)
+    if (!targetInfo) continue
+    if (!targetInfo.isFile() || targetInfo.isSymbolicLink()) {
+      outcome.skippedLegacy.push(filename)
+      continue
+    }
+    const current = await readFile(targetPath, 'utf8')
+    if (!current.startsWith(`${LEGACY_MANAGED_MARKER}\n`)) {
+      outcome.skippedLegacy.push(filename)
+      continue
+    }
+    await unlink(targetPath)
+    outcome.removedLegacy.push(filename)
   }
 
   await chmod(agentsDir, 0o700)
@@ -146,7 +180,7 @@ export async function removeAgentProfiles({ codexHome }) {
   const skipped = []
   if (!agentsDir) return { removed, skipped }
 
-  for (const filename of AGENT_PROFILE_FILES) {
+  for (const filename of [...AGENT_PROFILE_FILES, ...LEGACY_AGENT_PROFILE_FILES]) {
     const targetPath = path.join(agentsDir, filename)
     const targetInfo = await optionalStat(targetPath)
     if (!targetInfo) continue
@@ -155,7 +189,10 @@ export async function removeAgentProfiles({ codexHome }) {
       continue
     }
     const current = await readFile(targetPath, 'utf8')
-    if (!current.startsWith(`${MANAGED_MARKER}\n`)) {
+    if (
+      !current.startsWith(`${MANAGED_MARKER}\n`)
+      && !current.startsWith(`${LEGACY_MANAGED_MARKER}\n`)
+    ) {
       skipped.push(filename)
       continue
     }
@@ -187,7 +224,7 @@ async function main() {
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
   main().catch((error) => {
-    process.stderr.write(`codex-sol-fusion: ${error.message}\n`)
+    process.stderr.write(`gpt-5-6-orchestrator: ${error.message}\n`)
     process.exitCode = 1
   })
 }

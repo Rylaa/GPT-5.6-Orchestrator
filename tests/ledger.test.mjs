@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, realpath, rm, symlink, utimes, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -7,7 +7,6 @@ import test from 'node:test'
 import {
   MAX_LEDGER_BYTES,
   findLedger,
-  isLedgerOwnedBySession,
   parseLedger,
   patchTouchesOnlyLedger,
   readLedger,
@@ -31,7 +30,6 @@ test('finds a ledger upward through a repository', async () => {
 
 test('handles invalid roots and regular-file requirements', async () => {
   assert.equal(await findLedger(''), null)
-  assert.equal(await isLedgerOwnedBySession('/does/not/matter', Number.NaN), false)
   const root = await makeTempDir()
   await assert.rejects(() => readLedger(root), /regular file/i)
 })
@@ -111,17 +109,6 @@ test('parses open, complete, and explicitly deferred items', () => {
   ])
   assert.equal(parsed.totalItems, 6)
   assert.equal(parsed.closedItems, 3)
-})
-
-test('checks ledger ownership against the immutable session start', async () => {
-  const root = await makeTempDir()
-  const ledgerPath = path.join(root, 'LEDGER.md')
-  await writeFile(ledgerPath, '- [ ] current\n')
-  const now = Date.now()
-  await utimes(ledgerPath, new Date(now), new Date(now))
-
-  assert.equal(await isLedgerOwnedBySession(ledgerPath, now - 1_000), true)
-  assert.equal(await isLedgerOwnedBySession(ledgerPath, now + 1_000), false)
 })
 
 test('allows a bootstrap patch only when every target is the ledger', () => {

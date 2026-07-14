@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${PLUGIN_ROOT}/hooks/sol-fusion-hook.mjs\" user-prompt-submit",
+            "command": "node \"${PLUGIN_ROOT}/hooks/orchestrator-hook.mjs\" user-prompt-submit",
             "timeout": 10
           }
         ]
@@ -13,11 +13,11 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "^apply_patch$",
+        "matcher": "^(?:apply_patch|spawn_agent|.*(?:__|\\.)spawn_agent)$",
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${PLUGIN_ROOT}/hooks/sol-fusion-hook.mjs\" pre-tool-use",
+            "command": "node \"${PLUGIN_ROOT}/hooks/orchestrator-hook.mjs\" pre-tool-use",
             "timeout": 10
           }
         ]
@@ -28,7 +28,29 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${PLUGIN_ROOT}/hooks/sol-fusion-hook.mjs\" subagent-start",
+            "command": "node \"${PLUGIN_ROOT}/hooks/orchestrator-hook.mjs\" subagent-start",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/hooks/orchestrator-hook.mjs\" subagent-stop",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/hooks/orchestrator-hook.mjs\" stop",
             "timeout": 10
           }
         ]

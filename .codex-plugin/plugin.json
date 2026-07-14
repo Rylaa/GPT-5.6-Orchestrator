@@ -1,23 +1,27 @@
 {
   "name": "codex-sol-fusion",
-  "version": "0.1.0",
-  "description": "Model-aware Codex orchestration with Sol/Luna routing and ledger guards.",
+  "version": "0.1.0+codex.20260714130235",
+  "description": "Sol Max directs dynamic, task-shaped Luna, Terra, and Sol Codex subagents.",
   "author": {
     "name": "Yusuf"
   },
   "license": "MIT",
   "skills": "./skills/",
   "interface": {
-    "displayName": "Codex Sol Fusion",
-    "shortDescription": "Route Codex work between Sol and Luna with guarded orchestration.",
-    "longDescription": "Adds model-aware Sol/Luna workflow guidance, proportional ledger guards, and independent verification roles.",
+    "displayName": "GPT-5.6 Orchestrator",
+    "shortDescription": "Sol Max directs dynamic task-shaped workers.",
+    "longDescription": "Keeps GPT-5.6 Sol at max in the main session as planner, subagent controller, consequential decision maker, and final authority while dynamically routing bounded work to pinned Luna, Terra, or Sol Codex subagents.",
     "developerName": "Yusuf",
     "category": "Productivity",
-    "capabilities": ["Interactive", "Read", "Write"],
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
     "defaultPrompt": [
-      "Run this task with Sol-led orchestration and Luna workers.",
-      "Use Luna for bounded work and Sol for judgment and verification.",
-      "Audit the current workflow ledger and close verified items."
+      "Use $gpt-5-6-orchestrator and keep GPT-5.6 Sol at max in the main session.",
+      "Have main-session Sol decide, dynamically launch and control pinned Luna, Terra, or Sol Codex subagents, and retain every consequential decision and final acceptance.",
+      "Verify worker proof, direct tests, review evidence, and the current workflow ledger before closing work."
     ]
   }
 }

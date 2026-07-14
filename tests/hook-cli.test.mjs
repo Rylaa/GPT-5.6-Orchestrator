@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process'
 import test from 'node:test'
 
 const pluginRoot = path.resolve(import.meta.dirname, '..')
-const hookPath = path.join(pluginRoot, 'hooks', 'sol-fusion-hook.mjs')
+const hookPath = path.join(pluginRoot, 'hooks', 'orchestrator-hook.mjs')
 
 function runHook(action, input, env) {
   return new Promise((resolve, reject) => {
@@ -26,13 +26,14 @@ function runHook(action, input, env) {
 }
 
 test('hook CLI consumes Codex JSON and emits schema-valid JSON', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'codex-sol-fusion-cli-'))
-  const result = await runHook('session-start', JSON.stringify({
+  const root = await mkdtemp(path.join(os.tmpdir(), 'g56o-cli-'))
+  const result = await runHook('user-prompt-submit', JSON.stringify({
     session_id: 'session-e2e',
     cwd: root,
     model: 'gpt-5.6-sol',
-    hook_event_name: 'SessionStart',
-    source: 'startup',
+    hook_event_name: 'UserPromptSubmit',
+    turn_id: 'turn-e2e',
+    prompt: '$gpt-5-6-orchestrator review this task',
   }), {
     cwd: root,
     PLUGIN_ROOT: pluginRoot,
@@ -41,22 +42,22 @@ test('hook CLI consumes Codex JSON and emits schema-valid JSON', async () => {
 
   assert.equal(result.code, 0)
   const output = JSON.parse(result.stdout)
-  assert.equal(output.hookSpecificOutput.hookEventName, 'SessionStart')
-  assert.match(output.hookSpecificOutput.additionalContext, /Sol chair/i)
+  assert.equal(output.hookSpecificOutput.hookEventName, 'UserPromptSubmit')
+  assert.match(output.hookSpecificOutput.additionalContext, /Sol at max/i)
 })
 
 test('hook CLI fails open on malformed or oversized input', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'codex-sol-fusion-cli-'))
+  const root = await mkdtemp(path.join(os.tmpdir(), 'g56o-cli-'))
   const env = {
     cwd: root,
     PLUGIN_ROOT: pluginRoot,
     PLUGIN_DATA: path.join(root, 'data'),
   }
-  const malformed = await runHook('session-start', '{not-json', env)
+  const malformed = await runHook('user-prompt-submit', '{not-json', env)
   assert.equal(malformed.code, 0)
   assert.equal(malformed.stdout, '')
 
-  const oversized = await runHook('session-start', 'x'.repeat(1_100_000), env)
+  const oversized = await runHook('user-prompt-submit', 'x'.repeat(1_100_000), env)
   assert.equal(oversized.code, 0)
   assert.equal(oversized.stdout, '')
 })
