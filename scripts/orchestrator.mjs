@@ -340,9 +340,13 @@ export async function runWorker({ runId, workerId, dataDir = defaultDataDir(), e
   try {
     eventsHandle = await open(eventsPath, 'w', 0o600)
     stderrHandle = await open(stderrPath, 'w', 0o600)
+    const workerEnv = {
+      ...env,
+      GPT56_ORCHESTRATOR_DISABLE: '1',
+    }
     const child = spawn(codexBin, args, {
       cwd: run.cwd,
-      env,
+      env: workerEnv,
       stdio: ['pipe', eventsHandle.fd, stderrHandle.fd],
     })
     const outcome = await new Promise((resolve, reject) => {

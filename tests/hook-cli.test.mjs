@@ -33,7 +33,7 @@ test('hook CLI consumes Codex JSON and emits schema-valid JSON', async () => {
     model: 'gpt-5.6-sol',
     hook_event_name: 'UserPromptSubmit',
     turn_id: 'turn-e2e',
-    prompt: '$gpt-5-6-orchestrator review this task',
+    prompt: 'review this task',
   }), {
     cwd: root,
     PLUGIN_ROOT: pluginRoot,
@@ -44,6 +44,7 @@ test('hook CLI consumes Codex JSON and emits schema-valid JSON', async () => {
   const output = JSON.parse(result.stdout)
   assert.equal(output.hookSpecificOutput.hookEventName, 'UserPromptSubmit')
   assert.match(output.hookSpecificOutput.additionalContext, /Sol at max/i)
+  assert.match(output.hookSpecificOutput.additionalContext, /Decompose every request/i)
 })
 
 test('hook CLI fails open on malformed or oversized input', async () => {

@@ -50,12 +50,13 @@ There is no worker judge. The Sol Max main session is the judge. Sol workers are
 Install from a checkout registered in your personal Codex marketplace. The legacy package ID remains `codex-sol-fusion` so existing installations update in place; the product and skill are GPT-5.6 Orchestrator.
 
 ```sh
-node scripts/manage-agent-profiles.mjs install
 codex plugin add codex-sol-fusion@personal
 codex -m gpt-5.6-sol -c 'model_reasoning_effort="max"' -c 'service_tier="fast"'
 ```
 
-Inspect and trust the command hooks with `/hooks`, then run:
+In that first session, open `/hooks`, inspect the plugin command hooks, and trust them. This one-time review is a Codex safety boundary; a changed hook is reviewed again after an update. Start a fresh Sol Max session after trust. From then on, every main-session prompt automatically enters the Orchestrator workflow; no invocation token is required.
+
+Codex plugin installation does not run lifecycle scripts or rewrite `~/.codex/AGENTS.md`. The bundled trusted hook is the supported automatic activation path. To opt out of automatic activation, set `GPT56_ORCHESTRATOR_AUTO=0`; the exact token still enables one session explicitly:
 
 ```text
 $gpt-5-6-orchestrator <your task>
@@ -80,11 +81,11 @@ Write workers additionally require `--allow-write`. Task files must be regular n
 ```text
 +------+------------------------------------------------------------------+
 | 1    | Sol Max reads the task and decides the first routing wave.       |
-| 2    | Luna handles explicit, clear, repeatable lanes quickly.          |
-| 3    | Terra handles broad scans and everyday judgment-heavy work.      |
-| 4    | Critical deep implementation stays with main Sol or a Sol worker.|
-| 5    | Writers finish and direct tests pass before reviewers start.     |
-| 6    | Every worker returns proof and evidence; main Sol accepts or not. |
+| 2    | It decomposes every request and asks on material ambiguity.       |
+| 3    | Luna handles explicit, clear, repeatable lanes quickly.           |
+| 4    | Terra handles broad scans and everyday judgment-heavy work.       |
+| 5    | Critical deep implementation stays with main Sol or a Sol worker. |
+| 6    | Writers finish and direct tests pass before reviewers start.      |
 +------+------------------------------------------------------------------+
 ```
 
@@ -92,11 +93,11 @@ The main session can add subagents as evidence changes, like Claude Code Dynamic
 
 ## Runtime proof
 
-Each worker is a lean, isolated background `codex exec` subagent pinned to its exact model and effort on service tier `fast`. Unrelated user config is skipped; required runtime settings are passed explicitly. It records `events.jsonl`, `result.md`, `stderr.log`, and `proof.json`. Completion requires a non-empty Codex thread ID, a completed turn event, a zero exit code, and a non-empty result. Process launch alone is never treated as success. No tmux or daemon is required.
+Each worker is a lean, isolated background `codex exec` subagent pinned to its exact model and effort on service tier `fast`. Unrelated user config is skipped, automatic Orchestrator hooks are disabled inside worker runtimes, and required settings are passed explicitly. It records `events.jsonl`, `result.md`, `stderr.log`, and `proof.json`. Completion requires a non-empty Codex thread ID, a completed turn event, a zero exit code, and a non-empty result. Process launch alone is never treated as success. No tmux or daemon is required.
 
 On Codex CLI 0.144.4, the default direct collaboration schema cannot pin a named role, model, or effort from a Sol root. The bundled Codex subagent controller is the current exact-routing path; native subagents become preferable when the active schema can prove those pins. Generic unpinned children fail closed.
 
-Managed access values are defaults; the live permission and sandbox policy can override them. Workers cannot spawn descendants. Hooks and process controls are workflow reminders, not a security boundary, and globally discovered hooks remain inert until the exact `$gpt-5-6-orchestrator` token is used.
+Managed access values are defaults; the live permission and sandbox policy can override them. Workers cannot spawn descendants or ask the user questions; ambiguity returns to main Sol. Trusted hooks activate automatically only on main-session prompts. Set `GPT56_ORCHESTRATOR_DISABLE=1` to disable all plugin hooks. Hooks and process controls are workflow reminders, not a security boundary.
 
 ## License
 

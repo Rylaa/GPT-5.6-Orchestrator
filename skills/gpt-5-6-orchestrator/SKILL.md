@@ -7,7 +7,7 @@ description: Use when the user requests GPT-5.6 Orchestrator, Sol-led dynamic wo
 
 Keep GPT-5.6 Sol at `max` in the main interactive session. That main Sol session is the permanent chair: it understands the request, makes the plan, chooses and controls workers, resolves every consequential decision, performs the most important reasoning, and owns final acceptance. Luna, Terra, and additional Sol processes are bounded workers, never co-equal decision makers.
 
-The exact `$gpt-5-6-orchestrator` token activates this plugin's otherwise inert hooks for the current session. Do not claim the hooks affect unrelated sessions.
+Once this installed plugin's command hooks are trusted, its `UserPromptSubmit` hook activates the workflow automatically for every main-session prompt. The exact `$gpt-5-6-orchestrator` token remains an explicit fallback when `GPT56_ORCHESTRATOR_AUTO=0`; `GPT56_ORCHESTRATOR_DISABLE=1` disables all plugin hooks. Never apply main-session activation to child-agent prompts.
 
 ## Runtime contract
 
@@ -65,9 +65,13 @@ Classify each lane by ambiguity, breadth, repeatability, write scope, dependency
 
 Prompt length controls ledger policy, not model routing.
 
+## Clarification gate
+
+Decompose every request into task-shaped lanes before acting, even when efficiency calls for one inline lane and no worker. Resolve safely discoverable facts from the workspace before asking the user. If remaining ambiguity can materially change scope, architecture, a destructive or external action, cost, security, acceptance criteria, or user-visible behavior, the main Sol session asks concise clarification before delegation or mutation. Workers never ask the user; they stop their lane and return the ambiguity to main Sol. Do not delay safe, reversible work with unnecessary questions.
+
 ## Workflow
 
-1. Sol reads the request and current evidence. For serious multi-step work, create `.workflow/LEDGER.md` with stable requirement, constraint, and edge-case checkboxes.
+1. Sol reads the request and current evidence, decomposes it into task-shaped lanes, and applies the clarification gate. For serious multi-step work, create `.workflow/LEDGER.md` with stable requirement, constraint, and edge-case checkboxes.
 2. Sol decides the first routing wave and creates one orchestration run. Spawn workers dynamically as evidence changes; a static all-at-once plan is not required.
 3. Parallelize only independent discovery or disjoint file ownership. Never run overlapping writers, a writer with its reviewer, or dependency-ordered work concurrently.
 4. Sol monitors worker status and may stop or replace a worker. A worker returns evidence to Sol; it does not assign follow-up work.
@@ -82,7 +86,7 @@ Prompt length controls ledger policy, not model routing.
 - Batch related evidence into bounded worker tasks and reuse one run rather than creating many runs.
 - Prefer Luna for mechanical speed, Terra for broad/context-heavy work, and additional Sol only for frontier reasoning or high-risk verification.
 - Poll with short `status` or bounded `wait` calls; keep the main session responsive.
-- Every worker runs on service tier `fast`, has lean isolated context, writes durable artifacts, and cannot spawn descendants. The fallback controller ignores unrelated user config while passing every required model, effort, sandbox, and tier setting explicitly.
+- Every worker runs on service tier `fast`, has lean isolated context, writes durable artifacts, and cannot spawn descendants. The fallback controller ignores unrelated user config, forces `GPT56_ORCHESTRATOR_DISABLE=1` in worker runtimes to prevent recursive orchestration, and passes every required model, effort, sandbox, and tier setting explicitly.
 - The main Sol session may open new workers as the task evolves, matching Claude Code Dynamic Workflows' lead-session plus dynamic-subagent pattern.
 
 Hooks and process controls are workflow guardrails, not a security boundary. The live sandbox and permission policy remain authoritative.

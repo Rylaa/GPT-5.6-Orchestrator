@@ -93,6 +93,9 @@ test('active Sol prompts establish main-session authority and exact subagent pro
   assert.match(context, /bundled Codex subagent controller/i)
   assert.match(context, /non-empty thread ID/i)
   assert.match(context, /review.*after.*writer.*tests/i)
+  assert.match(context, /Decompose every request into task-shaped lanes/i)
+  assert.match(context, /only the main Sol session asks concise clarification/i)
+  assert.match(context, /Workers never ask the user/i)
 })
 
 test('Terra, Luna, and unknown roots are rejected as Orchestrator chairs', async () => {
@@ -307,23 +310,46 @@ test('Stop recognizes Turkish claims, ignores descriptions, and avoids recursion
   assert.equal(recursive, null)
 })
 
-test('hooks remain inert until explicit activation and stay active afterward', async () => {
+test('hooks auto-activate, honor opt-out, and retain explicit-token fallback', async () => {
   const fixture = await makeFixture()
-  const inert = await submitPrompt(fixture, {
-    turnId: 'turn-unrelated',
-    prompt: 'unrelated '.repeat(200),
+  const automatic = await submitPrompt(fixture, {
+    turnId: 'turn-automatic',
+    prompt: 'ordinary task '.repeat(200),
     env: { GPT56_ORCHESTRATOR_LEDGER_THRESHOLD: '100' },
+  })
+  assert.match(automatic.hookSpecificOutput.additionalContext, /LEDGER\.md/)
+  assert.equal((await readSessionState(fixture.dataDir, 'session-1')).explicitlyActivated, false)
+
+  const disabledAfterAuto = await submitPrompt(fixture, {
+    turnId: 'turn-auto-disabled',
+    prompt: 'ordinary follow-up',
+    env: { GPT56_ORCHESTRATOR_AUTO: '0' },
+  })
+  assert.equal(disabledAfterAuto, null)
+  assert.equal((await readSessionState(fixture.dataDir, 'session-1')).active, false)
+
+  const optedOut = await makeFixture()
+  const inert = await submitPrompt(optedOut, {
+    prompt: 'ordinary task',
+    env: { GPT56_ORCHESTRATOR_AUTO: 'off' },
   })
   assert.equal(inert, null)
-  assert.equal(await readSessionState(fixture.dataDir, 'session-1'), null)
+  assert.equal(await readSessionState(optedOut.dataDir, 'session-1'), null)
 
-  await submitPrompt(fixture)
-  const later = await submitPrompt(fixture, {
+  await submitPrompt(optedOut, {
+    prompt: explicitPrompt(),
+    env: { GPT56_ORCHESTRATOR_AUTO: 'false' },
+  })
+  const later = await submitPrompt(optedOut, {
     turnId: 'turn-later',
     prompt: 'x'.repeat(200),
-    env: { GPT56_ORCHESTRATOR_LEDGER_THRESHOLD: '100' },
+    env: {
+      GPT56_ORCHESTRATOR_AUTO: '0',
+      GPT56_ORCHESTRATOR_LEDGER_THRESHOLD: '100',
+    },
   })
   assert.match(later.hookSpecificOutput.additionalContext, /LEDGER\.md/)
+  assert.equal((await readSessionState(optedOut.dataDir, 'session-1')).explicitlyActivated, true)
 })
 
 test('stale turns, malformed payloads, disabled hooks, and irrelevant tools fail open', async () => {
