@@ -8,9 +8,12 @@ import { promisify } from 'node:util'
 
 import {
   claimsTaskCompletion,
+  normalizeQaProfile,
   normalizeQaTier,
+  qaPolicy,
   QA_TIERS,
   validateClosure,
+  validateReleaseProofPath,
   validateTestProofPath,
   validateWorkerProofPath,
   workspaceDigest,
@@ -28,6 +31,17 @@ test('defines risk-shaped QA tiers and detects only strong completion claims', (
   ])
   assert.equal(normalizeQaTier('Q2'), 'q2')
   assert.throws(() => normalizeQaTier('q9'), /q0, q1, q2, or q3/i)
+  assert.throws(() => normalizeQaTier('__proto__'), /q0, q1, q2, or q3/i)
+  assert.equal(normalizeQaProfile(undefined, 'q1'), 'standard')
+  assert.equal(normalizeQaProfile('DEPLOY-FAST', 'q1'), 'deploy-fast')
+  assert.throws(() => normalizeQaProfile('deploy-fast', 'q2'), /only valid with q1/i)
+  assert.throws(() => normalizeQaProfile('__proto__', 'q1'), /standard or deploy-fast/i)
+  assert.deepEqual(qaPolicy({ tier: 'q1', profile: 'deploy-fast' }), {
+    label: 'Q1 Deploy Fast',
+    testsRequired: false,
+    reviewRoles: [],
+    releaseRequired: true,
+  })
   for (const message of [
     'Done. The implementation is ready.',
     'The plugin implementation has been completed.',
@@ -43,6 +57,30 @@ test('defines risk-shaped QA tiers and detects only strong completion claims', (
     'Updated code, but I am still reviewing the implementation.',
     'I need one clarification before proceeding.',
   ]) assert.equal(claimsTaskCompletion(message), false)
+})
+
+test('release proof validation rejects invalid phases and paths outside private run storage', async () => {
+  const invalidPhase = await validateReleaseProofPath({
+    proofPath: '/tmp/not-used.json',
+    phase: 'publish',
+    cwd: '/tmp',
+    dataDir: '/tmp/controller',
+    expectedDigest: 'digest',
+    expectedGitSha: 'a'.repeat(40),
+  })
+  assert.equal(invalidPhase.valid, false)
+  assert.match(invalidPhase.reason, /invalid phase/i)
+
+  const outside = await validateReleaseProofPath({
+    proofPath: '/tmp/outside-proof.json',
+    phase: 'predeploy',
+    cwd: '/tmp',
+    dataDir: '/tmp/controller',
+    expectedDigest: 'digest',
+    expectedGitSha: 'a'.repeat(40),
+  })
+  assert.equal(outside.valid, false)
+  assert.match(outside.reason, /outside the runs directory/i)
 })
 
 test('non-git digest ignores workflow metadata but changes with deliverable files', async () => {

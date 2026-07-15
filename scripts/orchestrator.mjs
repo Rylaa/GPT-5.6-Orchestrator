@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import {
   chmod,
@@ -20,6 +20,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { promisify } from 'node:util'
 
 import {
   MANAGED_AGENT_TYPES,
@@ -32,23 +33,33 @@ import {
 } from '../lib/ledger.mjs'
 import {
   assertContainedPath,
+  gitHeadSha,
+  gitRemoteBranchSha,
   isQaReviewRole,
+  normalizeQaProfile,
   normalizeQaTier,
-  QA_TIERS,
+  qaPolicy,
+  RELEASE_PHASES,
   readContainedBoundedJson,
   validateClosure,
+  validateReleaseEvidence,
+  validateReleaseProofPath,
   validateTestProofPath,
   validateWorkerProofPath,
   workspaceDigest,
 } from '../lib/qa.mjs'
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url)
+const execFileAsync = promisify(execFile)
 const IDENTIFIER = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/
+const SAFE_REMOTE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const TERMINAL_STATES = new Set(['completed', 'failed', 'stopped'])
 const MAX_TASK_BYTES = 128 * 1024
 const MAX_CONCURRENCY = 8
 const MAX_TEST_COMMAND_PARTS = 128
 const MAX_TEST_TIMEOUT_SECONDS = 3600
+const MAX_RELEASE_LOG_BYTES = 4 * 1024 * 1024
+const MAX_GIT_BUFFER_BYTES = 8 * 1024 * 1024
 
 export function defaultDataDir(env = process.env) {
   return path.resolve(
@@ -128,11 +139,21 @@ function testDir(dataDir, runId, testId) {
   return path.join(testsDir(dataDir, runId), assertIdentifier(testId, 'test id'))
 }
 
+function releaseDir(dataDir, runId) {
+  return path.join(runDir(dataDir, runId), 'release')
+}
+
+function releasePhaseDir(dataDir, runId, phase) {
+  if (!RELEASE_PHASES.includes(String(phase || ''))) throw new Error('Invalid release phase')
+  return path.join(releaseDir(dataDir, runId), phase)
+}
+
 export async function createRun({
   cwd,
   objective,
   runId,
   qaTier,
+  qaProfile,
   dataDir = defaultDataDir(),
 }) {
   const resolvedCwd = await realpath(path.resolve(cwd || process.cwd()))
@@ -152,6 +173,14 @@ export async function createRun({
   if (ledger?.qaTier && normalizedQaTier !== ledger.qaTier) {
     throw new Error(`QA tier ${normalizedQaTier} does not match ledger tier ${ledger.qaTier}`)
   }
+  const ledgerQaProfile = normalizeQaProfile(ledger?.qaProfile || 'standard', normalizedQaTier)
+  const normalizedQaProfile = normalizeQaProfile(
+    qaProfile || ledger?.qaProfile || 'standard',
+    normalizedQaTier,
+  )
+  if (ledger && normalizedQaProfile !== ledgerQaProfile) {
+    throw new Error(`QA profile ${normalizedQaProfile} does not match ledger profile ${ledgerQaProfile}`)
+  }
   await ensurePrivateDirectory(dataDir)
   await ensurePrivateDirectory(runsDir(dataDir))
   const targetRunDir = runDir(dataDir, normalizedRunId)
@@ -159,12 +188,14 @@ export async function createRun({
   await mkdir(targetRunDir, { mode: 0o700 })
   await mkdir(path.join(targetRunDir, 'workers'), { mode: 0o700 })
   await mkdir(path.join(targetRunDir, 'tests'), { mode: 0o700 })
+  await mkdir(path.join(targetRunDir, 'release'), { mode: 0o700 })
   const manifest = {
     schemaVersion: 1,
     runId: normalizedRunId,
     objective: normalizedObjective,
     cwd: resolvedCwd,
     qaTier: normalizedQaTier,
+    qaProfile: normalizedQaProfile,
     controller: {
       model: 'gpt-5.6-sol',
       effort: 'max',
@@ -189,6 +220,10 @@ export async function loadRun({ runId, dataDir = defaultDataDir() }) {
   return {
     ...manifest,
     qaTier: normalizeQaTier(manifest.qaTier || 'q1'),
+    qaProfile: normalizeQaProfile(
+      manifest.qaProfile || 'standard',
+      normalizeQaTier(manifest.qaTier || 'q1'),
+    ),
     runDir: targetRunDir,
   }
 }
@@ -251,6 +286,9 @@ export async function materializeWorker({
   const role = resolveManagedAgentRole(roleName)
   if (!role) {
     throw new Error(`Unknown role ${roleName}. Choose one of: ${MANAGED_AGENT_TYPES.join(', ')}`)
+  }
+  if (run.qaProfile === 'deploy-fast' && isQaReviewRole(roleName)) {
+    throw new Error('deploy-fast uses release evidence and does not allow a QA reviewer worker')
   }
   if (role.sandbox === 'workspace-write' && !allowWrite) {
     throw new Error(`${roleName} requires explicit --allow-write approval`)
@@ -578,6 +616,7 @@ export async function getRunStatus({ runId, dataDir = defaultDataDir() }) {
     objective: run.objective,
     cwd: run.cwd,
     qaTier: run.qaTier,
+    qaProfile: run.qaProfile,
     controller: run.controller,
     workerBackend: run.workerBackend,
     complete: workers.length > 0 && workers.every((worker) => TERMINAL_STATES.has(worker.status)),
@@ -587,17 +626,392 @@ export async function getRunStatus({ runId, dataDir = defaultDataDir() }) {
   }
 }
 
-function normalizeTestCommand(command) {
+function normalizeEvidenceCommand(command, label) {
   if (!Array.isArray(command) || command.length === 0 || command.length > MAX_TEST_COMMAND_PARTS) {
-    throw new Error(`test command must contain between 1 and ${MAX_TEST_COMMAND_PARTS} parts`)
+    throw new Error(`${label} command must contain between 1 and ${MAX_TEST_COMMAND_PARTS} parts`)
   }
   return command.map((part) => {
     const value = String(part)
     if (!value || value.length > 4096 || value.includes('\0')) {
-      throw new Error('test command contains an invalid part')
+      throw new Error(`${label} command contains an invalid part`)
     }
     return value
   })
+}
+
+function normalizeTestCommand(command) {
+  return normalizeEvidenceCommand(command, 'test')
+}
+
+function normalizeReleaseTarget(target) {
+  const normalized = String(target || '').trim()
+  if (!normalized || normalized.length > 2048 || normalized.includes('\0')) {
+    throw new Error('release target must contain between 1 and 2048 safe characters')
+  }
+  return normalized
+}
+
+function bindPredeployCommand(command, gitSha) {
+  const hasPlaceholder = command.includes('{sha}')
+  if (!hasPlaceholder) {
+    throw new Error('predeploy command must include {sha} as an exact argument')
+  }
+  return command.map((part) => part === '{sha}' ? gitSha : part)
+}
+
+function normalizeRemote(remote) {
+  const normalized = String(remote || '')
+  if (!SAFE_REMOTE.test(normalized)) {
+    throw new Error('remote must be a bounded named Git remote')
+  }
+  return normalized
+}
+
+async function gitText(cwd, args) {
+  const result = await execFileAsync('git', ['-C', cwd, ...args], {
+    encoding: 'utf8',
+    maxBuffer: MAX_GIT_BUFFER_BYTES,
+    env: {
+      ...process.env,
+      GIT_ALLOW_PROTOCOL: 'file:https:http:ssh:git',
+      GIT_OPTIONAL_LOCKS: '0',
+      GIT_SSH_COMMAND: 'ssh',
+    },
+  })
+  return result.stdout
+}
+
+async function normalizeBranch(cwd, branch) {
+  const normalized = String(branch || '')
+  if (
+    !normalized
+    || normalized.length > 1024
+    || normalized.startsWith('-')
+    || normalized.includes('\0')
+  ) throw new Error('branch must be a bounded Git branch name')
+  await gitText(cwd, ['check-ref-format', '--branch', normalized])
+  return normalized
+}
+
+async function gitRepositorySnapshot(cwd) {
+  const root = (await gitText(cwd, ['rev-parse', '--show-toplevel'])).trim()
+  const gitSha = await gitHeadSha(root)
+  const status = await gitText(root, [
+    'status',
+    '--porcelain=v1',
+    '-z',
+    '--untracked-files=all',
+    '--',
+    '.',
+    ':(exclude).workflow',
+    ':(exclude).workflow/**',
+  ])
+  return {
+    root,
+    gitSha,
+    dirtyEntryCount: status.split('\0').filter(Boolean).length,
+  }
+}
+
+function requireCleanReleaseSnapshot(snapshot) {
+  if (snapshot.dirtyEntryCount > 0) {
+    throw new Error(
+      `deploy-fast requires a clean tracked source tree outside .workflow (${snapshot.dirtyEntryCount} change(s))`,
+    )
+  }
+}
+
+async function strictlyLaterIso(previousTimestamp = 0) {
+  const previous = Number(previousTimestamp) || 0
+  if (previous > Date.now() + 1000) throw new Error('Prior release evidence has a future timestamp')
+  if (Date.now() <= previous) await delay(previous - Date.now() + 1)
+  return new Date().toISOString()
+}
+
+async function runBoundedCommand({ command, cwd, env, timeoutSeconds, stdoutPath, stderrPath }) {
+  let stdoutBytes = 0
+  let stderrBytes = 0
+  let outputLimitExceeded = false
+  const stdoutChunks = []
+  const stderrChunks = []
+  let child
+  let killTimer = null
+  let timeoutTimer = null
+  let timedOut = false
+
+  const append = (chunk, chunks, currentBytes) => {
+    const buffer = Buffer.from(chunk)
+    const remaining = Math.max(0, MAX_RELEASE_LOG_BYTES - currentBytes)
+    if (remaining > 0) chunks.push(buffer.subarray(0, remaining))
+    if (buffer.length > remaining) outputLimitExceeded = true
+    return currentBytes + Math.min(buffer.length, remaining)
+  }
+  const terminate = () => {
+    if (!child || child.killed) return
+    child.kill('SIGTERM')
+    killTimer = setTimeout(() => child.kill('SIGKILL'), 1000)
+  }
+
+  const outcome = await new Promise((resolve) => {
+    let settled = false
+    child = spawn(command[0], command.slice(1), {
+      cwd,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    child.stdout.on('data', (chunk) => {
+      stdoutBytes = append(chunk, stdoutChunks, stdoutBytes)
+      if (outputLimitExceeded) terminate()
+    })
+    child.stderr.on('data', (chunk) => {
+      stderrBytes = append(chunk, stderrChunks, stderrBytes)
+      if (outputLimitExceeded) terminate()
+    })
+    timeoutTimer = setTimeout(() => {
+      timedOut = true
+      terminate()
+    }, timeoutSeconds * 1000)
+    child.once('error', (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeoutTimer)
+      clearTimeout(killTimer)
+      resolve({ code: null, signal: null, error: error.message })
+    })
+    child.once('close', (code, signal) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeoutTimer)
+      clearTimeout(killTimer)
+      resolve({
+        code,
+        signal,
+        error: timedOut
+          ? 'release command timed out'
+          : outputLimitExceeded ? 'release command exceeded the log limit' : null,
+      })
+    })
+  })
+  await Promise.all([
+    writeFile(stdoutPath, Buffer.concat(stdoutChunks), { mode: 0o600 }),
+    writeFile(stderrPath, Buffer.concat(stderrChunks), { mode: 0o600 }),
+  ])
+  return { ...outcome, timedOut, outputLimitExceeded }
+}
+
+function latestWriterCompletion(workers) {
+  return Math.max(0, ...workers
+    .filter((worker) => worker.sandbox === 'workspace-write' && TERMINAL_STATES.has(worker.status))
+    .map((worker) => requiredTimestamp(worker.completedAt, `worker ${worker.workerId}`)))
+}
+
+async function validateReleasePrefix({
+  phase,
+  run,
+  dataDir,
+  digest,
+  gitSha,
+  latestWriterAt,
+  target,
+}) {
+  if (phase === 'predeploy') return { completedAt: latestWriterAt }
+  const predeploy = await validateReleaseProofPath({
+    proofPath: path.join(releasePhaseDir(dataDir, run.runId, 'predeploy'), 'proof.json'),
+    phase: 'predeploy',
+    cwd: run.cwd,
+    dataDir,
+    expectedDigest: digest,
+    expectedGitSha: gitSha,
+    expectedRunId: run.runId,
+  })
+  if (!predeploy.valid) throw new Error(`Current predeploy evidence is required: ${predeploy.reason}`)
+  const currentRemoteSha = await gitRemoteBranchSha(
+    run.cwd,
+    predeploy.proof.remote,
+    predeploy.proof.branch,
+  )
+  if (currentRemoteSha !== gitSha) {
+    throw new Error('The named remote branch no longer matches the release Git SHA')
+  }
+  if (requiredTimestamp(predeploy.proof.startedAt, 'predeploy') <= latestWriterAt) {
+    throw new Error('Predeploy must start strictly after write workers finish')
+  }
+  if (phase === 'deploy') {
+    return {
+      completedAt: requiredTimestamp(predeploy.proof.completedAt, 'predeploy'),
+      remote: predeploy.proof.remote,
+      branch: predeploy.proof.branch,
+      remoteSha: currentRemoteSha,
+    }
+  }
+  const deploy = await validateReleaseProofPath({
+    proofPath: path.join(releasePhaseDir(dataDir, run.runId, 'deploy'), 'proof.json'),
+    phase: 'deploy',
+    cwd: run.cwd,
+    dataDir,
+    expectedDigest: digest,
+    expectedGitSha: gitSha,
+    expectedRunId: run.runId,
+    expectedTarget: target,
+  })
+  if (!deploy.valid) throw new Error(`Current deploy evidence is required: ${deploy.reason}`)
+  if (
+    deploy.proof.remote !== predeploy.proof.remote
+    || deploy.proof.branch !== predeploy.proof.branch
+  ) throw new Error('Named remote or branch changed between release phases')
+  if (
+    requiredTimestamp(deploy.proof.startedAt, 'deploy')
+    <= requiredTimestamp(predeploy.proof.completedAt, 'predeploy')
+  ) throw new Error('Deploy must start strictly after predeploy finishes')
+  return {
+    completedAt: requiredTimestamp(deploy.proof.completedAt, 'deploy'),
+    remote: predeploy.proof.remote,
+    branch: predeploy.proof.branch,
+    remoteSha: currentRemoteSha,
+  }
+}
+
+export async function runReleaseEvidence({
+  runId,
+  phase,
+  command,
+  remote = 'origin',
+  branch,
+  target,
+  timeoutSeconds = 900,
+  dataDir = defaultDataDir(),
+  env = process.env,
+}) {
+  const run = await loadRun({ runId, dataDir })
+  if (run.qaTier !== 'q1' || run.qaProfile !== 'deploy-fast') {
+    throw new Error('release evidence is only valid for q1 deploy-fast runs')
+  }
+  const normalizedPhase = String(phase || '').toLowerCase()
+  if (!RELEASE_PHASES.includes(normalizedPhase)) {
+    throw new Error(`release phase must be one of ${RELEASE_PHASES.join(', ')}`)
+  }
+  const normalizedCommand = normalizeEvidenceCommand(command, 'release')
+  const normalizedTimeout = Number(timeoutSeconds)
+  if (!Number.isInteger(normalizedTimeout) || normalizedTimeout < 1 || normalizedTimeout > MAX_TEST_TIMEOUT_SECONDS) {
+    throw new Error(`release timeout must be between 1 and ${MAX_TEST_TIMEOUT_SECONDS} seconds`)
+  }
+  const workers = await listWorkerRecords({ runId, dataDir })
+  if (workers.some((worker) => !TERMINAL_STATES.has(worker.status))) {
+    throw new Error('All workers must reach a terminal state before release evidence')
+  }
+  const latestWriterAt = latestWriterCompletion(workers)
+  const snapshot = await gitRepositorySnapshot(run.cwd)
+  requireCleanReleaseSnapshot(snapshot)
+  const digest = await workspaceDigest(run.cwd)
+  const normalizedTarget = normalizedPhase === 'predeploy' ? null : normalizeReleaseTarget(target)
+  const requestedRemote = normalizedPhase === 'predeploy' ? normalizeRemote(remote) : null
+  const requestedBranch = normalizedPhase === 'predeploy'
+    ? await normalizeBranch(snapshot.root, branch)
+    : null
+  const requestedRemoteSha = normalizedPhase === 'predeploy'
+    ? await gitRemoteBranchSha(snapshot.root, requestedRemote, requestedBranch)
+    : null
+  if (requestedRemoteSha && requestedRemoteSha !== snapshot.gitSha) {
+    throw new Error(`Local HEAD does not match ${requestedRemote}/${requestedBranch}`)
+  }
+
+  const prefix = await validateReleasePrefix({
+    phase: normalizedPhase,
+    run,
+    dataDir,
+    digest,
+    gitSha: snapshot.gitSha,
+    latestWriterAt,
+    target: normalizedTarget,
+  })
+  const normalizedRemote = requestedRemote || prefix.remote
+  const normalizedBranch = requestedBranch || prefix.branch
+  const remoteShaBefore = requestedRemoteSha || prefix.remoteSha
+  const boundCommand = normalizedPhase === 'predeploy'
+    ? bindPredeployCommand(normalizedCommand, snapshot.gitSha)
+    : normalizedCommand
+  const targetPhaseDir = releasePhaseDir(dataDir, runId, normalizedPhase)
+  if (await optionalStat(targetPhaseDir)) {
+    throw new Error(`Release evidence already exists for phase ${normalizedPhase}`)
+  }
+  await mkdir(targetPhaseDir, { mode: 0o700 })
+  const stdoutPath = path.join(targetPhaseDir, 'stdout.log')
+  const stderrPath = path.join(targetPhaseDir, 'stderr.log')
+  const proofPath = path.join(targetPhaseDir, 'proof.json')
+  const startedAt = await strictlyLaterIso(prefix.completedAt)
+  const outcome = await runBoundedCommand({
+    command: boundCommand,
+    cwd: run.cwd,
+    env: {
+      ...env,
+      GPT56_RELEASE_PHASE: normalizedPhase,
+      GPT56_RELEASE_GIT_SHA: snapshot.gitSha,
+      GPT56_RELEASE_TARGET: normalizedTarget || '',
+    },
+    timeoutSeconds: normalizedTimeout,
+    stdoutPath,
+    stderrPath,
+  })
+
+  let finalSnapshot = null
+  let completedDigest = null
+  let remoteSha = null
+  let postconditionError = null
+  try {
+    finalSnapshot = await gitRepositorySnapshot(run.cwd)
+    completedDigest = await workspaceDigest(run.cwd)
+    remoteSha = await gitRemoteBranchSha(
+      finalSnapshot.root,
+      normalizedRemote,
+      normalizedBranch,
+    )
+  } catch (error) {
+    postconditionError = error.message
+  }
+  const workspaceChanged = !finalSnapshot
+    || !completedDigest
+    || finalSnapshot.gitSha !== snapshot.gitSha
+    || completedDigest !== digest
+    || finalSnapshot.dirtyEntryCount > 0
+  const passed = outcome.code === 0
+    && outcome.signal === null
+    && outcome.timedOut === false
+    && outcome.outputLimitExceeded === false
+    && !postconditionError
+    && workspaceChanged === false
+    && remoteShaBefore === snapshot.gitSha
+    && remoteSha === snapshot.gitSha
+  const completedAt = new Date().toISOString()
+  const proof = {
+    schemaVersion: 1,
+    status: passed ? 'passed' : 'failed',
+    runId,
+    phase: normalizedPhase,
+    qaProfile: 'deploy-fast',
+    command: boundCommand,
+    shaBound: normalizedPhase === 'predeploy' ? true : null,
+    exitCode: outcome.code,
+    signal: outcome.signal,
+    error: [outcome.error, postconditionError].filter(Boolean).join('; ') || null,
+    timedOut: outcome.timedOut,
+    outputLimitExceeded: outcome.outputLimitExceeded,
+    gitSha: snapshot.gitSha,
+    localSha: snapshot.gitSha,
+    remote: normalizedRemote,
+    branch: normalizedBranch,
+    remoteShaBefore,
+    remoteSha,
+    target: normalizedTarget,
+    workspaceDigestStarted: digest,
+    workspaceDigest: completedDigest,
+    workspaceChanged,
+    startedAt,
+    completedAt,
+    stdoutPath,
+    stderrPath,
+  }
+  await writeJsonAtomic(proofPath, proof)
+  return { ...proof, proofPath }
 }
 
 export async function runTestEvidence({
@@ -711,6 +1125,10 @@ export async function closeRun({
   if (ledger.qaTier !== run.qaTier) {
     throw new Error(`Run tier ${run.qaTier} does not match ledger tier ${ledger.qaTier || 'missing'}`)
   }
+  const ledgerProfile = normalizeQaProfile(ledger.qaProfile || 'standard', run.qaTier)
+  if (ledgerProfile !== run.qaProfile) {
+    throw new Error(`Run profile ${run.qaProfile} does not match ledger profile ${ledgerProfile}`)
+  }
   if (ledger.totalItems === 0 || ledger.openItems.length > 0) {
     throw new Error(`Ledger must have no open items (${ledger.openItems.length} open)`)
   }
@@ -723,75 +1141,96 @@ export async function closeRun({
   }
 
   const currentDigest = await workspaceDigest(run.cwd)
-  const currentTests = []
-  for (const proofPath of await listTestProofPaths({ runId, dataDir })) {
-    const result = await validateTestProofPath({
-      proofPath,
-      cwd: run.cwd,
-      dataDir,
-      expectedDigest: currentDigest,
-      expectedRunId: runId,
-    })
-    if (result.valid) currentTests.push({ ...result.proof, proofPath })
-  }
-  const tierPolicy = QA_TIERS[run.qaTier]
-  const latestWriterAt = Math.max(0, ...workers
-    .filter((worker) => worker.sandbox === 'workspace-write' && TERMINAL_STATES.has(worker.status))
-    .map((worker) => requiredTimestamp(worker.completedAt, `worker ${worker.workerId}`)))
-  const eligibleTests = currentTests.filter(
-    (proof) => requiredTimestamp(proof.startedAt, `test ${proof.testId}`) > latestWriterAt,
-  )
-  if (tierPolicy.testsRequired && eligibleTests.length === 0) {
-    throw new Error(`${run.qaTier.toUpperCase()} requires passing tests after write workers finish`)
-  }
-
-  const currentReviews = []
-  for (const worker of workers) {
-    if (!isQaReviewRole(worker.role) || !worker.proofPath) continue
-    const result = await validateWorkerProofPath({
-      proofPath: worker.proofPath,
-      cwd: run.cwd,
-      dataDir,
-      expectedDigest: currentDigest,
-      requireStable: true,
-      expectedRunId: runId,
-    })
-    if (result.valid) currentReviews.push({ ...result.proof, proofPath: worker.proofPath })
-  }
+  const tierPolicy = qaPolicy({ tier: run.qaTier, profile: run.qaProfile })
+  const latestWriterAt = latestWriterCompletion(workers)
+  let eligibleTests = []
   const reviewByRole = new Map()
-  for (const proof of currentReviews) {
-    const prior = reviewByRole.get(proof.role)
-    if (
-      !prior
-      || requiredTimestamp(proof.completedAt, `review ${proof.workerId}`)
-        > requiredTimestamp(prior.completedAt, `review ${prior.workerId}`)
-    ) {
-      reviewByRole.set(proof.role, proof)
+  let releaseClosure = null
+
+  if (tierPolicy.releaseRequired) {
+    const predeployPath = path.join(releasePhaseDir(dataDir, runId, 'predeploy'), 'proof.json')
+    const deployPath = path.join(releasePhaseDir(dataDir, runId, 'deploy'), 'proof.json')
+    const smokePath = path.join(releasePhaseDir(dataDir, runId, 'smoke'), 'proof.json')
+    const deployProof = await readContainedBoundedJson(runsDir(dataDir), deployPath)
+    releaseClosure = {
+      predeploy: predeployPath,
+      deploy: deployPath,
+      smoke: smokePath,
+      target: deployProof.target,
     }
-  }
-  for (const role of tierPolicy.reviewRoles) {
-    if (!reviewByRole.has(role)) throw new Error(`${run.qaTier.toUpperCase()} requires ${role}`)
-  }
-  const latestTestAt = Math.max(0, ...eligibleTests.map(
-    (proof) => requiredTimestamp(proof.completedAt, `test ${proof.testId}`),
-  ))
-  for (const role of tierPolicy.reviewRoles) {
-    const proof = reviewByRole.get(role)
-    if (requiredTimestamp(proof.startedAt, `review ${proof.workerId}`) <= latestTestAt) {
-      throw new Error(`${role} must start strictly after direct tests finish`)
+    const releaseResult = await validateReleaseEvidence({
+      release: releaseClosure,
+      cwd: run.cwd,
+      dataDir,
+      expectedDigest: currentDigest,
+      expectedRunId: runId,
+      latestWriterAt,
+    })
+    if (!releaseResult.valid) throw new Error(`deploy-fast release evidence is invalid: ${releaseResult.reason}`)
+  } else {
+    const currentTests = []
+    for (const proofPath of await listTestProofPaths({ runId, dataDir })) {
+      const result = await validateTestProofPath({
+        proofPath,
+        cwd: run.cwd,
+        dataDir,
+        expectedDigest: currentDigest,
+        expectedRunId: runId,
+      })
+      if (result.valid) currentTests.push({ ...result.proof, proofPath })
     }
-  }
-  if (run.qaTier === 'q3') {
-    const terraCompletedAt = requiredTimestamp(
-      reviewByRole.get('orchestrator_terra_reviewer').completedAt,
-      'Terra review',
+    eligibleTests = currentTests.filter(
+      (proof) => requiredTimestamp(proof.startedAt, `test ${proof.testId}`) > latestWriterAt,
     )
-    const solStartedAt = requiredTimestamp(
-      reviewByRole.get('orchestrator_sol_verifier').startedAt,
-      'Sol verification',
-    )
-    if (solStartedAt <= terraCompletedAt) {
-      throw new Error('Q3 Sol verification must start strictly after Terra review finishes')
+    if (tierPolicy.testsRequired && eligibleTests.length === 0) {
+      throw new Error(`${run.qaTier.toUpperCase()} requires passing tests after write workers finish`)
+    }
+
+    const currentReviews = []
+    for (const worker of workers) {
+      if (!isQaReviewRole(worker.role) || !worker.proofPath) continue
+      const result = await validateWorkerProofPath({
+        proofPath: worker.proofPath,
+        cwd: run.cwd,
+        dataDir,
+        expectedDigest: currentDigest,
+        requireStable: true,
+        expectedRunId: runId,
+      })
+      if (result.valid) currentReviews.push({ ...result.proof, proofPath: worker.proofPath })
+    }
+    for (const proof of currentReviews) {
+      const prior = reviewByRole.get(proof.role)
+      if (
+        !prior
+        || requiredTimestamp(proof.completedAt, `review ${proof.workerId}`)
+          > requiredTimestamp(prior.completedAt, `review ${prior.workerId}`)
+      ) reviewByRole.set(proof.role, proof)
+    }
+    for (const role of tierPolicy.reviewRoles) {
+      if (!reviewByRole.has(role)) throw new Error(`${run.qaTier.toUpperCase()} requires ${role}`)
+    }
+    const latestTestAt = Math.max(0, ...eligibleTests.map(
+      (proof) => requiredTimestamp(proof.completedAt, `test ${proof.testId}`),
+    ))
+    for (const role of tierPolicy.reviewRoles) {
+      const proof = reviewByRole.get(role)
+      if (requiredTimestamp(proof.startedAt, `review ${proof.workerId}`) <= latestTestAt) {
+        throw new Error(`${role} must start strictly after direct tests finish`)
+      }
+    }
+    if (run.qaTier === 'q3') {
+      const terraCompletedAt = requiredTimestamp(
+        reviewByRole.get('orchestrator_terra_reviewer').completedAt,
+        'Terra review',
+      )
+      const solStartedAt = requiredTimestamp(
+        reviewByRole.get('orchestrator_sol_verifier').startedAt,
+        'Sol verification',
+      )
+      if (solStartedAt <= terraCompletedAt) {
+        throw new Error('Q3 Sol verification must start strictly after Terra review finishes')
+      }
     }
   }
 
@@ -805,6 +1244,7 @@ export async function closeRun({
     status: 'accepted',
     runId,
     qaTier: run.qaTier,
+    qaProfile: run.qaProfile,
     workspaceDigest: currentDigest,
     ledger: {
       path: path.relative(run.cwd, ledgerPath),
@@ -813,6 +1253,7 @@ export async function closeRun({
     },
     tests: eligibleTests.map((proof) => proof.proofPath),
     reviews: tierPolicy.reviewRoles.map((role) => reviewByRole.get(role).proofPath),
+    release: releaseClosure,
     nonSuccessfulWorkers: nonSuccessfulWorkers.map((worker) => worker.workerId),
     solVerdict: 'accepted',
     createdAt: new Date().toISOString(),
@@ -900,9 +1341,11 @@ function printHelp() {
     'GPT-5.6 Orchestrator Codex worker controller',
     '',
     'Commands:',
-    '  create --cwd <dir> --objective <text> --qa-tier <q0|q1|q2|q3> [--run-id <id>]',
+    '  create --cwd <dir> --objective <text> --qa-tier <q0|q1|q2|q3> [--qa-profile <standard|deploy-fast>] [--run-id <id>]',
     '  spawn --run <id> --worker <id> --role <role> --task-file <path> [--allow-write]',
     '  test --run <id> --test-id <id> [--timeout-seconds <n>] -- <command> [args...]',
+    '  release --run <id> --phase <predeploy|deploy|smoke> [--remote <name> --branch <name>] [--target <label>] [--timeout-seconds <n>] -- <command> [args...]',
+    '    predeploy commands must contain {sha} as a standalone argument',
     '  close --run <id> --sol-verdict accepted [--accept-worker-failures]',
     '  status --run <id> [--json]',
     '  wait --run <id> [--worker <id>] [--timeout-seconds <n>] [--json]',
@@ -923,6 +1366,7 @@ async function main() {
       objective: options.objective,
       runId: options['run-id'],
       qaTier: options['qa-tier'],
+      qaProfile: options['qa-profile'],
       dataDir,
     })
   } else if (command === 'spawn') {
@@ -939,6 +1383,18 @@ async function main() {
       runId: options.run,
       testId: options['test-id'],
       command: passthrough,
+      timeoutSeconds: Number(options['timeout-seconds'] || 900),
+      dataDir,
+    })
+    if (result.status !== 'passed') process.exitCode = 1
+  } else if (command === 'release') {
+    result = await runReleaseEvidence({
+      runId: options.run,
+      phase: options.phase,
+      command: passthrough,
+      remote: options.remote || 'origin',
+      branch: options.branch,
+      target: options.target,
       timeoutSeconds: Number(options['timeout-seconds'] || 900),
       dataDir,
     })

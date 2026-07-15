@@ -1,6 +1,6 @@
 interface:
   display_name: "GPT-5.6 Orchestrator"
   short_description: "Sol Max directs dynamic Luna, Terra, and Sol workers."
-  default_prompt: "Use $gpt-5-6-orchestrator to keep Sol Max in the main session, clarify material ambiguity, route bounded workers dynamically, and close the work with risk-based QA evidence."
+  default_prompt: "Use $gpt-5-6-orchestrator to keep Sol Max in the main session, clarify material ambiguity, route bounded workers dynamically, and close with standard risk-based QA or exact-SHA Q1 deploy-fast release evidence."
 policy:
   allow_implicit_invocation: true

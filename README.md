@@ -19,7 +19,7 @@
                                 |
                      evidence returns to Sol
                                 |
-                    tests -> review -> Sol accepts
+                tests or release proof -> Sol accepts
 ```
 
 This is an Orchestrator, not a model fusion. GPT-5.6 Sol at `max` stays in the main interactive Codex session and controls the workflow. It dynamically opens bounded Luna, Terra, or additional Sol subagents, reads their evidence, makes every consequential decision, and owns the final answer.
@@ -70,6 +70,9 @@ The Sol main session uses the bundled controller. It creates one durable run, op
 node scripts/orchestrator.mjs create --cwd "$PWD" --objective "audit and fix the target" --qa-tier q2
 node scripts/orchestrator.mjs spawn --run <run-id> --worker scan --role orchestrator_terra_explorer --task-file .workflow/tasks/scan.md
 node scripts/orchestrator.mjs test --run <run-id> --test-id unit -- npm test
+node scripts/orchestrator.mjs release --run <run-id> --phase predeploy --remote origin --branch main -- <CI-status-command> <options> {sha}
+node scripts/orchestrator.mjs release --run <run-id> --phase deploy --target <url> -- <deploy-command>
+node scripts/orchestrator.mjs release --run <run-id> --phase smoke --target <url> -- <smoke-command>
 node scripts/orchestrator.mjs status --run <run-id> --json
 node scripts/orchestrator.mjs wait --run <run-id> --worker scan --timeout-seconds 30 --json
 node scripts/orchestrator.mjs close --run <run-id> --sol-verdict accepted
@@ -98,11 +101,12 @@ The main session can add subagents as evidence changes, like Claude Code Dynamic
 ```text
 Q0  tiny/read-only       Sol inline self-check; no QA worker
 Q1  bounded code         current test -> Luna checklist review
+Q1  deploy-fast          exact-SHA CI -> deploy -> same-target smoke
 Q2  cross-file/root cause current test -> Terra cross-file review
 Q3  critical/high risk   current test -> Terra review -> Sol verifier
 ```
 
-Sol selects the tier after clarification, records `QA-Tier: QN` in the ledger, and uses existing reviewers rather than an always-on QA agent. Tests and reviews are bound to a workspace digest; `.workflow` metadata and a later git commit do not invalidate them. The lightweight Stop hook runs no tests. It blocks only a ledger-backed completion claim whose ledger is open or whose `.workflow/closure.json` is missing, stale, lacks the tier-required proof and Sol acceptance, or does not match the controller's private receipt.
+Sol selects the tier after clarification, records `QA-Tier: QN` in the ledger, and uses existing reviewers rather than an always-on QA agent. For deployment-only work whose clean local HEAD already equals a remote branch with green exact-SHA CI, `QA-Profile: deploy-fast` plus `--qa-profile deploy-fast` skips the duplicate local suite and reviewer. The predeploy command must take standalone `{sha}`, which is expanded to the verified commit. The provider-neutral `release` phases re-read the named remote and bind CI status, deployment, and post-deploy smoke to one SHA, workspace digest, target, and strict order; source or remote-SHA uncertainty falls back to standard Q1/Q2. The lightweight Stop hook runs no tests. It validates `.workflow/closure.json` and the matching private receipt only.
 
 ## Runtime proof
 

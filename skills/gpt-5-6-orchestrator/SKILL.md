@@ -21,23 +21,26 @@ If the active main session is not GPT-5.6 Sol at `max`, do not pretend it is the
 
 Codex CLI 0.144.4's direct `collaboration.spawn_agent` schema cannot select a named profile, model, or reasoning effort, and its alternate Sol-root schema is rejected by the backend. For current exact routing, use only the bundled `scripts/orchestrator.mjs` controller. It starts independently logged background `codex exec` subagents with no terminal multiplexer or daemon. Do not start ad hoc nested Codex processes and do not use a generic native child for a named lane. Prefer native Codex subagents if a future active schema can prove the exact requested model and effort.
 
-The main Sol session remains the scheduler. The bundled controller performs only Sol's explicit `create`, `spawn`, `test`, `status`, `wait`, `close`, and `stop` commands; it never decides which worker to use or what result to accept. `close` records an acceptance only after the main Sol session supplies the verdict and all tier evidence validates.
+The main Sol session remains the scheduler. The bundled controller performs only Sol's explicit `create`, `spawn`, `test`, `release`, `status`, `wait`, `close`, and `stop` commands; it never decides which worker to use or what result to accept. `close` records an acceptance only after the main Sol session supplies the verdict and all tier evidence validates.
 
 ## Dynamic worker control
 
 Resolve `<plugin-root>` from this installed skill's location, then use the bundled controller:
 
 ```sh
-node <plugin-root>/scripts/orchestrator.mjs create --cwd "$PWD" --objective "<bounded objective>" --qa-tier <q0|q1|q2|q3>
+node <plugin-root>/scripts/orchestrator.mjs create --cwd "$PWD" --objective "<bounded objective>" --qa-tier <q0|q1|q2|q3> [--qa-profile deploy-fast]
 node <plugin-root>/scripts/orchestrator.mjs spawn --run <run-id> --worker <id> --role <role> --task-file <repo-local-task-file>
 node <plugin-root>/scripts/orchestrator.mjs test --run <run-id> --test-id <id> -- <command> [args...]
+node <plugin-root>/scripts/orchestrator.mjs release --run <run-id> --phase predeploy --remote origin --branch <branch> -- <CI-status-command> <options> {sha}
+node <plugin-root>/scripts/orchestrator.mjs release --run <run-id> --phase deploy --target <label-or-url> -- <deploy-or-status-command>
+node <plugin-root>/scripts/orchestrator.mjs release --run <run-id> --phase smoke --target <same-label-or-url> -- <post-deploy-smoke-command>
 node <plugin-root>/scripts/orchestrator.mjs status --run <run-id> --json
 node <plugin-root>/scripts/orchestrator.mjs wait --run <run-id> --worker <id> --timeout-seconds 30 --json
 node <plugin-root>/scripts/orchestrator.mjs close --run <run-id> --sol-verdict accepted
 node <plugin-root>/scripts/orchestrator.mjs stop --run <run-id> --worker <id>
 ```
 
-Task files must be regular non-symlink files inside the target working directory. Add `--allow-write` only after Sol has bounded a write worker's files and acceptance criteria. The controller caps a run at eight active workers. Every completed worker must have a non-empty `threadId`, a completed runtime event, and a `proof.json` whose role, model, effort, sandbox, and service tier match the requested lane. Read the worker's `result.md` and proof; never treat process launch success as task success. Test and review proofs are tied to a workspace digest that excludes `.workflow` metadata, so ledger updates and git commits do not invalidate current QA evidence.
+Task files must be regular non-symlink files inside the target working directory. Add `--allow-write` only after Sol has bounded a write worker's files and acceptance criteria. The controller caps a run at eight active workers. Every completed worker must have a non-empty `threadId`, a completed runtime event, and a `proof.json` whose role, model, effort, sandbox, and service tier match the requested lane. Read the worker's `result.md` and proof; never treat process launch success as task success. Test, review, and release proofs are tied to a workspace digest that excludes `.workflow` metadata, so ledger updates and content-preserving git commits do not invalidate them; release proof additionally pins the exact Git SHA.
 
 ## Roles
 
@@ -82,7 +85,9 @@ Select the QA tier after clarification and before implementation. Record it as `
 | `Q2` | Cross-file, integration, or root-cause work | Current direct test plus `orchestrator_terra_reviewer` |
 | `Q3` | Auth, security, money, migration, or genuinely high risk | Current direct test, Terra review, then `orchestrator_sol_verifier` |
 
-Do not create a permanent QA agent. Use the existing reviewer roles only when the selected tier requires them. Run tests through the controller after writers finish. Start reviewers only after current tests pass. For Q3, start the Sol verifier only after Terra review finishes. Close the ledger, inspect all evidence, and run `close`; it writes `.workflow/closure.json` plus a private controller receipt. A ledger-backed final completion claim is valid only while those records match, the closure matches the current workspace digest, and it contains Sol's explicit `accepted` verdict.
+For a deployment-only task, use `Q1` with `QA-Profile: deploy-fast` and `--qa-profile deploy-fast` only when the tracked source tree is clean, local HEAD already equals the named remote branch SHA, and the supplied predeploy command checks CI for that exact SHA. The predeploy command must contain `{sha}` as a standalone argument; the controller replaces it with the verified SHA and records the expanded command. It deliberately launches no QA reviewer and requires no duplicate local suite. Instead, run the three `release` phases in order; deploy and smoke must name the same target. The named remote branch is re-read before and after every phase and again at closure. Any source, local or remote SHA, target, failed-command, or phase-order drift invalidates closure. If code changed, the commit is not pushed, or exact-SHA CI is unknown, use standard Q1 or Q2.
+
+Do not create a permanent QA agent. Use the existing reviewer roles only when the selected standard tier requires them. Run tests through the controller after writers finish. Start reviewers only after current tests pass. For Q3, start the Sol verifier only after Terra review finishes. Close the ledger, inspect all evidence, and run `close`; it writes `.workflow/closure.json` plus a private controller receipt. A ledger-backed final completion claim is valid only while those records match, the closure matches the current workspace digest, and it contains Sol's explicit `accepted` verdict.
 
 ## Workflow
 
@@ -91,7 +96,7 @@ Do not create a permanent QA agent. Use the existing reviewer roles only when th
 3. Parallelize only independent discovery or disjoint file ownership. Never run overlapping writers, a writer with its reviewer, or dependency-ordered work concurrently.
 4. Sol monitors worker status and may stop or replace a worker. A worker returns evidence to Sol; it does not assign follow-up work.
 5. Sol handles the can-alici reasoning and consequential edits inline or assigns an approved bounded critical implementation to `orchestrator_sol_specialist`.
-6. Run targeted direct tests through `test` after writers. Parallelize independent lint, typecheck, and test commands when useful. Only then start the tier-required reviewer.
+6. For standard QA, run targeted direct tests through `test` after writers, then start the tier-required reviewer. For Q1 deploy-fast, skip duplicate local QA and record ordered exact-SHA CI, deployment, and post-deploy smoke evidence through `release`.
 7. Sol reconciles evidence, closes every ledger item, inspects current files and git diff, and runs `close`. Add the independent Sol verifier only for Q3.
 8. Cite the accepted `.workflow/closure.json` in the final completion response. Worker consensus is evidence, not a vote.
 

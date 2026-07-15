@@ -96,6 +96,7 @@ test('rejects a symlinked workflow directory that escapes the repository', async
 test('parses open, complete, and explicitly deferred items', () => {
   const parsed = parseLedger(`
 QA-Tier: Q2
+QA-Profile: deploy-fast
 - [ ] 1. Open item
 - [x] 2. Complete item
 * [X] 3. Complete too
@@ -111,6 +112,7 @@ QA-Tier: Q2
   assert.equal(parsed.totalItems, 6)
   assert.equal(parsed.closedItems, 3)
   assert.equal(parsed.qaTier, 'q2')
+  assert.equal(parsed.qaProfile, 'deploy-fast')
 })
 
 test('allows a bootstrap patch only when every target is the ledger', () => {

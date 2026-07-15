@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import {
   chmod,
   mkdir,
@@ -11,6 +11,7 @@ import {
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import { promisify } from 'node:util'
 
 import { resolveManagedAgentRole } from '../lib/routing.mjs'
 import { validateClosure } from '../lib/qa.mjs'
@@ -23,11 +24,14 @@ import {
   launchWorker,
   loadRun,
   materializeWorker,
+  runReleaseEvidence,
   runTestEvidence,
   runWorker,
   stopWorkers,
   waitForWorkers,
 } from '../scripts/orchestrator.mjs'
+
+const execFileAsync = promisify(execFile)
 
 async function makeWorkspace() {
   const cwd = await mkdtemp(path.join(os.tmpdir(), 'g56o-workspace-'))
@@ -42,11 +46,43 @@ async function writeTask(cwd, name = 'task.md') {
   return taskPath
 }
 
-async function writeLedger(cwd, tier = 'Q1', status = 'x') {
+async function writeLedger(cwd, tier = 'Q1', status = 'x', profile = null) {
   const ledgerPath = path.join(cwd, '.workflow', 'LEDGER.md')
-  await writeFile(ledgerPath, `QA-Tier: ${tier}\n- [${status}] 1. Acceptance requirement\n`)
+  const profileLine = profile ? `QA-Profile: ${profile}\n` : ''
+  await writeFile(ledgerPath, `QA-Tier: ${tier}\n${profileLine}- [${status}] 1. Acceptance requirement\n`)
   return ledgerPath
 }
+
+async function makeReleaseWorkspace() {
+  const fixture = await makeWorkspace()
+  const remote = await mkdtemp(path.join(os.tmpdir(), 'g56o-remote-'))
+  await writeFile(path.join(fixture.cwd, 'app.js'), 'export const ready = true\n')
+  await writeLedger(fixture.cwd, 'Q1', 'x', 'deploy-fast')
+  await execFileAsync('git', ['init', '-q', '-b', 'main', fixture.cwd])
+  await execFileAsync('git', ['-C', fixture.cwd, 'config', 'user.email', 'release@example.invalid'])
+  await execFileAsync('git', ['-C', fixture.cwd, 'config', 'user.name', 'Release Test'])
+  await execFileAsync('git', ['-C', fixture.cwd, 'add', 'app.js'])
+  await execFileAsync('git', ['-C', fixture.cwd, 'commit', '-qm', 'initial'])
+  await execFileAsync('git', ['init', '--bare', '-q', remote])
+  await execFileAsync('git', ['-C', fixture.cwd, 'remote', 'add', 'origin', remote])
+  await execFileAsync('git', ['-C', fixture.cwd, 'push', '-qu', 'origin', 'main'])
+  return { ...fixture, remote }
+}
+
+async function advanceRemote(remote) {
+  const parent = await mkdtemp(path.join(os.tmpdir(), 'g56o-remote-writer-'))
+  const clone = path.join(parent, 'clone')
+  await execFileAsync('git', ['clone', '-q', '--branch', 'main', remote, clone])
+  await execFileAsync('git', ['-C', clone, 'config', 'user.email', 'remote@example.invalid'])
+  await execFileAsync('git', ['-C', clone, 'config', 'user.name', 'Remote Writer'])
+  await writeFile(path.join(clone, 'remote-change.txt'), `${Date.now()}\n`)
+  await execFileAsync('git', ['-C', clone, 'add', 'remote-change.txt'])
+  await execFileAsync('git', ['-C', clone, 'commit', '-qm', 'advance remote'])
+  await execFileAsync('git', ['-C', clone, 'push', '-q', 'origin', 'main'])
+}
+
+const passingCommand = () => [process.execPath, '-e', 'process.exit(0)']
+const passingCiCommand = () => [...passingCommand(), '{sha}']
 
 async function fakeCodex(root, { completed = true, exitCode = 0, delayMs = 0 } = {}) {
   const executable = path.join(root, `fake-codex-${completed}-${exitCode}-${delayMs}.mjs`)
@@ -313,6 +349,366 @@ test('failed or stale tests cannot satisfy QA closure', async () => {
   )
 })
 
+test('deploy-fast closes Q1 from exact remote SHA, deploy, and smoke evidence without duplicate QA', async () => {
+  const { cwd, dataDir, remote } = await makeReleaseWorkspace()
+  const taskFile = await writeTask(cwd, 'forbidden-review.md')
+  const run = await createRun({
+    cwd,
+    objective: 'Deploy an already green SHA',
+    runId: 'deploy-fast-run',
+    qaTier: 'q1',
+    qaProfile: 'deploy-fast',
+    dataDir,
+  })
+  assert.equal(run.qaProfile, 'deploy-fast')
+  await assert.rejects(() => materializeWorker({
+    runId: run.runId,
+    workerId: 'review',
+    role: 'orchestrator_luna_reviewer',
+    taskFile,
+    dataDir,
+  }), /does not allow a QA reviewer/i)
+  await assert.rejects(
+    () => closeRun({ runId: run.runId, solVerdict: 'accepted', dataDir }),
+    /release|deploy|ENOENT/i,
+  )
+
+  const predeploy = await runReleaseEvidence({
+    runId: run.runId,
+    phase: 'predeploy',
+    remote: 'origin',
+    branch: 'main',
+    command: passingCiCommand(),
+    dataDir,
+  })
+  assert.equal(predeploy.status, 'passed')
+  assert.equal(predeploy.localSha, predeploy.remoteSha)
+  assert.equal(predeploy.shaBound, true)
+  assert.ok(predeploy.command.includes(predeploy.gitSha))
+  const deployed = await runReleaseEvidence({
+    runId: run.runId,
+    phase: 'deploy',
+    target: 'preview.example.invalid',
+    command: passingCommand(),
+    dataDir,
+  })
+  assert.equal(deployed.status, 'passed')
+  const smoke = await runReleaseEvidence({
+    runId: run.runId,
+    phase: 'smoke',
+    target: 'preview.example.invalid',
+    command: passingCommand(),
+    dataDir,
+  })
+  assert.equal(smoke.status, 'passed')
+
+  const closure = await closeRun({ runId: run.runId, solVerdict: 'accepted', dataDir })
+  assert.equal(closure.qaTier, 'q1')
+  assert.equal(closure.qaProfile, 'deploy-fast')
+  assert.deepEqual(closure.tests, [])
+  assert.deepEqual(closure.reviews, [])
+  assert.equal(closure.release.target, 'preview.example.invalid')
+  assert.equal((await validateClosure({ cwd, dataDir })).valid, true)
+
+  const smokePayload = JSON.parse(await readFile(smoke.proofPath, 'utf8'))
+  const actualSmokeStartedAt = smokePayload.startedAt
+  smokePayload.startedAt = deployed.completedAt
+  await writeFile(smoke.proofPath, JSON.stringify(smokePayload))
+  const reordered = await validateClosure({ cwd, dataDir })
+  assert.equal(reordered.valid, false)
+  assert.match(reordered.reason, /smoke.*strictly after deploy/i)
+  smokePayload.startedAt = actualSmokeStartedAt
+  await writeFile(smoke.proofPath, JSON.stringify(smokePayload))
+
+  await advanceRemote(remote)
+  const remoteStale = await validateClosure({ cwd, dataDir })
+  assert.equal(remoteStale.valid, false)
+  assert.match(remoteStale.reason, /remote branch no longer matches/i)
+  await execFileAsync('git', ['-C', cwd, 'push', '-q', '--force', 'origin', 'HEAD:main'])
+  assert.equal((await validateClosure({ cwd, dataDir })).valid, true)
+
+  await writeFile(path.join(cwd, 'app.js'), 'export const ready = false\n')
+  const stale = await validateClosure({ cwd, dataDir })
+  assert.equal(stale.valid, false)
+  assert.match(stale.reason, /workspace changed|stale/i)
+})
+
+test('deploy-fast rejects dirty source, unpushed SHA, failed CI evidence, and target drift', async () => {
+  const dirty = await makeReleaseWorkspace()
+  await createRun({
+    cwd: dirty.cwd,
+    objective: 'Reject dirty release',
+    runId: 'dirty-release',
+    qaTier: 'q1',
+    qaProfile: 'deploy-fast',
+    dataDir: dirty.dataDir,
+  })
+  await writeFile(path.join(dirty.cwd, 'app.js'), 'export const ready = false\n')
+  await assert.rejects(() => runReleaseEvidence({
+    runId: 'dirty-release',
+    phase: 'predeploy',
+    remote: 'origin',
+    branch: 'main',
+    command: passingCommand(),
+    dataDir: dirty.dataDir,
+  }), /clean tracked source tree/i)
+
+  const unpushed = await makeReleaseWorkspace()
+  await writeFile(path.join(unpushed.cwd, 'app.js'), 'export const ready = false\n')
+  await execFileAsync('git', ['-C', unpushed.cwd, 'add', 'app.js'])
+  await execFileAsync('git', ['-C', unpushed.cwd, 'commit', '-qm', 'not pushed'])
+  await createRun({
+    cwd: unpushed.cwd,
+    objective: 'Reject unpushed SHA',
+    runId: 'unpushed-release',
+    qaTier: 'q1',
+    qaProfile: 'deploy-fast',
+    dataDir: unpushed.dataDir,
+  })
+  await assert.rejects(() => runReleaseEvidence({
+    runId: 'unpushed-release',
+    phase: 'predeploy',
+    remote: 'origin',
+    branch: 'main',
+    command: passingCommand(),
+    dataDir: unpushed.dataDir,
+  }), /does not match origin\/main/i)
+
+  const failed = await makeReleaseWorkspace()
+  await createRun({
+    cwd: failed.cwd,
+    objective: 'Record failed CI check',
+    runId: 'failed-release',
+    qaTier: 'q1',
+    qaProfile: 'deploy-fast',
+    dataDir: failed.dataDir,
+  })
+  const failedProof = await runReleaseEvidence({
+    runId: 'failed-release',
+    phase: 'predeploy',
+    remote: 'origin',
+    branch: 'main',
+    command: [process.execPath, '-e', 'process.exit(7)', '{sha}'],
+    dataDir: failed.dataDir,
+  })
+  assert.equal(failedProof.status, 'failed')
+  await assert.rejects(() => runReleaseEvidence({
+    runId: 'failed-release',
+    phase: 'deploy',
+    target: 'preview.example.invalid',
+    command: passingCommand(),
+    dataDir: failed.dataDir,
+  }), /current predeploy evidence is required/i)
+
+  const remoteDrift = await makeReleaseWorkspace()
+  await createRun({
+    cwd: remoteDrift.cwd,
+    objective: 'Reject remote SHA drift',
+    runId: 'remote-drift',
+    qaTier: 'q1',
+    qaProfile: 'deploy-fast',
+    dataDir: remoteDrift.dataDir,
+  })
+  await runReleaseEvidence({
+    runId: 'remote-drift', phase: 'predeploy', remote: 'origin', branch: 'main',
+    command: passingCiCommand(), dataDir: remoteDrift.dataDir,
+  })
+  await advanceRemote(remoteDrift.remote)
+  await assert.rejects(() => runReleaseEvidence({
+    runId: 'remote-drift', phase: 'deploy', target: 'preview.example.invalid',
+    command: passingCommand(), dataDir: remoteDrift.dataDir,
+  }), /remote branch no longer matches/i)
+
+  const drift = await makeReleaseWorkspace()
+  await createRun({
+    cwd: drift.cwd,
+    objective: 'Reject release target drift',
+    runId: 'target-drift',
+    qaTier: 'q1',
+    qaProfile: 'deploy-fast',
+    dataDir: drift.dataDir,
+  })
+  await runReleaseEvidence({
+    runId: 'target-drift', phase: 'predeploy', remote: 'origin', branch: 'main',
+    command: passingCiCommand(), dataDir: drift.dataDir,
+  })
+  await runReleaseEvidence({
+    runId: 'target-drift', phase: 'deploy', target: 'one.example.invalid',
+    command: passingCommand(), dataDir: drift.dataDir,
+  })
+  await assert.rejects(() => runReleaseEvidence({
+    runId: 'target-drift', phase: 'smoke', target: 'two.example.invalid',
+    command: passingCommand(), dataDir: drift.dataDir,
+  }), /target.*changed|target.*invalid/i)
+  await assert.rejects(() => runReleaseEvidence({
+    runId: 'target-drift', phase: 'predeploy', remote: '--upload-pack=bad', branch: 'main',
+    command: passingCommand(), dataDir: drift.dataDir,
+  }), /bounded named Git remote/i)
+})
+
+test('deploy-fast is Q1-only and must match the ledger profile', async () => {
+  const { cwd, dataDir } = await makeWorkspace()
+  await assert.rejects(() => createRun({
+    cwd,
+    objective: 'Invalid profile tier',
+    runId: 'invalid-profile-tier',
+    qaTier: 'q2',
+    qaProfile: 'deploy-fast',
+    dataDir,
+  }), /only valid with q1/i)
+
+  await writeLedger(cwd, 'Q1')
+  await assert.rejects(() => createRun({
+    cwd,
+    objective: 'Mismatched ledger profile',
+    runId: 'profile-mismatch',
+    qaTier: 'q1',
+    qaProfile: 'deploy-fast',
+    dataDir,
+  }), /does not match ledger profile standard/i)
+})
+
+test('release CLI contract rejects malformed input, duplicate phases, and active workers', async () => {
+  const standard = await makeWorkspace()
+  await writeLedger(standard.cwd, 'Q1')
+  await createRun({
+    cwd: standard.cwd,
+    objective: 'Standard run cannot record release proof',
+    runId: 'standard-release',
+    qaTier: 'q1',
+    dataDir: standard.dataDir,
+  })
+  await assert.rejects(() => runReleaseEvidence({
+    runId: 'standard-release', phase: 'predeploy', branch: 'main',
+    command: passingCommand(), dataDir: standard.dataDir,
+  }), /only valid for q1 deploy-fast/i)
+
+  const fixture = await makeReleaseWorkspace()
+  await createRun({
+    cwd: fixture.cwd,
+    objective: 'Validate release inputs',
+    runId: 'release-inputs',
+    qaTier: 'q1',
+    qaProfile: 'deploy-fast',
+    dataDir: fixture.dataDir,
+  })
+  const base = { runId: 'release-inputs', dataDir: fixture.dataDir }
+  await assert.rejects(
+    () => runReleaseEvidence({ ...base, phase: 'publish', command: passingCommand() }),
+    /phase must be one of/i,
+  )
+  await assert.rejects(
+    () => runReleaseEvidence({ ...base, phase: 'predeploy', branch: 'main', command: [] }),
+    /between 1 and 128 parts/i,
+  )
+  await assert.rejects(
+    () => runReleaseEvidence({ ...base, phase: 'predeploy', branch: 'main', command: [''] }),
+    /invalid part/i,
+  )
+  await assert.rejects(
+    () => runReleaseEvidence({
+      ...base, phase: 'predeploy', branch: 'main', command: passingCommand(), timeoutSeconds: 0,
+    }),
+    /timeout must be between/i,
+  )
+  await assert.rejects(
+    () => runReleaseEvidence({
+      ...base, phase: 'predeploy', branch: '--bad', command: passingCommand(),
+    }),
+    /bounded Git branch name/i,
+  )
+  await assert.rejects(
+    () => runReleaseEvidence({
+      ...base, phase: 'predeploy', remote: 'origin', branch: 'main', command: passingCommand(),
+    }),
+    /must include \{sha\}/i,
+  )
+  const literalSha = (await execFileAsync(
+    'git', ['-C', fixture.cwd, 'rev-parse', 'HEAD'], { encoding: 'utf8' },
+  )).stdout.trim()
+  await assert.rejects(
+    () => runReleaseEvidence({
+      ...base,
+      phase: 'predeploy',
+      remote: 'origin',
+      branch: 'main',
+      command: [...passingCommand(), literalSha],
+    }),
+    /must include \{sha\}/i,
+  )
+
+  await runReleaseEvidence({
+    ...base, phase: 'predeploy', remote: 'origin', branch: 'main', command: passingCiCommand(),
+  })
+  await assert.rejects(
+    () => runReleaseEvidence({
+      ...base, phase: 'predeploy', remote: 'origin', branch: 'main', command: passingCiCommand(),
+    }),
+    /already exists for phase predeploy/i,
+  )
+  await assert.rejects(
+    () => runReleaseEvidence({ ...base, phase: 'deploy', command: passingCommand() }),
+    /release target must contain/i,
+  )
+
+  const taskFile = await writeTask(fixture.cwd, 'active.md')
+  await materializeWorker({
+    runId: 'release-inputs',
+    workerId: 'active',
+    role: 'orchestrator_luna_gatherer',
+    taskFile,
+    dataDir: fixture.dataDir,
+  })
+  await assert.rejects(
+    () => runReleaseEvidence({
+      ...base, phase: 'deploy', target: 'preview', command: passingCommand(),
+    }),
+    /all workers must reach a terminal state/i,
+  )
+})
+
+test('release logs are bounded and a missing executable records failed proof', async () => {
+  const fixture = await makeReleaseWorkspace()
+  await createRun({
+    cwd: fixture.cwd,
+    objective: 'Bound release logs',
+    runId: 'release-log-limit',
+    qaTier: 'q1',
+    qaProfile: 'deploy-fast',
+    dataDir: fixture.dataDir,
+  })
+  const overflow = await runReleaseEvidence({
+    runId: 'release-log-limit',
+    phase: 'predeploy',
+    remote: 'origin',
+    branch: 'main',
+    command: [process.execPath, '-e', 'process.stdout.write("x".repeat(5 * 1024 * 1024))', '{sha}'],
+    dataDir: fixture.dataDir,
+  })
+  assert.equal(overflow.status, 'failed')
+  assert.equal(overflow.outputLimitExceeded, true)
+  assert.equal((await readFile(overflow.stdoutPath)).length, 4 * 1024 * 1024)
+
+  await createRun({
+    cwd: fixture.cwd,
+    objective: 'Record missing release executable',
+    runId: 'release-missing-command',
+    qaTier: 'q1',
+    qaProfile: 'deploy-fast',
+    dataDir: fixture.dataDir,
+  })
+  const missing = await runReleaseEvidence({
+    runId: 'release-missing-command',
+    phase: 'predeploy',
+    remote: 'origin',
+    branch: 'main',
+    command: ['/definitely/missing/g56o-release-command', '{sha}'],
+    dataDir: fixture.dataDir,
+  })
+  assert.equal(missing.status, 'failed')
+  assert.match(missing.error, /ENOENT/i)
+})
+
 test('requires tests to start strictly after write workers finish', async () => {
   const { cwd, dataDir } = await makeWorkspace()
   await writeFile(path.join(cwd, 'app.js'), 'export const ready = true\n')
@@ -523,6 +919,38 @@ test('CLI runs test evidence and writes an accepted Q0 closure', async () => {
   ], env)
   assert.equal(closed.code, 0)
   assert.equal(JSON.parse(closed.stdout).status, 'accepted')
+})
+
+test('CLI completes a provider-neutral deploy-fast release sequence', async () => {
+  const { cwd, dataDir } = await makeReleaseWorkspace()
+  const env = { GPT56_ORCHESTRATOR_DATA_DIR: dataDir }
+  const created = await runCli([
+    'create', '--cwd', cwd, '--objective', 'CLI deploy fast', '--qa-tier', 'q1',
+    '--qa-profile', 'deploy-fast', '--run-id', 'release-cli',
+  ], env)
+  assert.equal(created.code, 0, created.stderr)
+  assert.equal(JSON.parse(created.stdout).qaProfile, 'deploy-fast')
+
+  const predeploy = await runCli([
+    'release', '--run', 'release-cli', '--phase', 'predeploy', '--remote', 'origin',
+    '--branch', 'main', '--', ...passingCiCommand(),
+  ], env)
+  assert.equal(predeploy.code, 0, predeploy.stderr)
+  const deployed = await runCli([
+    'release', '--run', 'release-cli', '--phase', 'deploy', '--target', 'cli-preview',
+    '--', ...passingCommand(),
+  ], env)
+  assert.equal(deployed.code, 0, deployed.stderr)
+  const smoke = await runCli([
+    'release', '--run', 'release-cli', '--phase', 'smoke', '--target', 'cli-preview',
+    '--', ...passingCommand(),
+  ], env)
+  assert.equal(smoke.code, 0, smoke.stderr)
+  const closed = await runCli([
+    'close', '--run', 'release-cli', '--sol-verdict', 'accepted',
+  ], env)
+  assert.equal(closed.code, 0, closed.stderr)
+  assert.equal(JSON.parse(closed.stdout).release.target, 'cli-preview')
 })
 
 test('run and worker validation covers automatic IDs, empty runs, duplicates, and write approval', async () => {
