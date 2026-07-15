@@ -7,6 +7,7 @@ import test from 'node:test'
 import { handleHook } from '../lib/hook-handler.mjs'
 import { resolveManagedAgentRole } from '../lib/routing.mjs'
 import { readSessionState } from '../lib/state.mjs'
+import { closeRun, createRun } from '../scripts/orchestrator.mjs'
 
 const SKILL_TOKEN = '$gpt-5-6-orchestrator'
 
@@ -79,6 +80,8 @@ async function writeRunnerProof(fixture, {
     threadId: valid ? 'thread-proof' : '',
     runtimeCompleted: true,
     exitCode: 0,
+    startedAt: '2026-07-14T00:00:00.000Z',
+    completedAt: '2026-07-14T00:00:01.000Z',
   }))
   return proofPath
 }
@@ -96,6 +99,8 @@ test('active Sol prompts establish main-session authority and exact subagent pro
   assert.match(context, /Decompose every request into task-shaped lanes/i)
   assert.match(context, /only the main Sol session asks concise clarification/i)
   assert.match(context, /Workers never ask the user/i)
+  assert.match(context, /Q0 inline, Q1 Luna review, Q2 Terra review, or Q3 Terra plus Sol/i)
+  assert.match(context, /closure\.json/i)
 })
 
 test('Terra, Luna, and unknown roots are rejected as Orchestrator chairs', async () => {
@@ -308,6 +313,53 @@ test('Stop recognizes Turkish claims, ignores descriptions, and avoids recursion
     last_assistant_message: 'orchestrator_terra_worker completed.',
   }), { env: {}, dataDir: fixture.dataDir, now: () => 2_200 })
   assert.equal(recursive, null)
+})
+
+test('Stop allows progress but blocks completion until ledger-backed QA closure is accepted', async () => {
+  const fixture = await makeFixture()
+  await submitPrompt(fixture)
+  await mkdir(path.join(fixture.cwd, '.workflow'))
+  const ledgerPath = path.join(fixture.cwd, '.workflow', 'LEDGER.md')
+  await writeFile(ledgerPath, 'QA-Tier: Q1\n- [ ] 1. Requirement\n')
+  const openLedger = await handleHook('stop', basePayload(fixture.cwd, {
+    turn_id: 'turn-1',
+    stop_hook_active: false,
+    last_assistant_message: 'Implementation completed.',
+  }), { env: {}, dataDir: fixture.dataDir, now: () => 2_000 })
+  assert.equal(openLedger.decision, 'block')
+  assert.match(openLedger.reason, /ledger.*1 open/i)
+
+  await writeFile(ledgerPath, 'QA-Tier: Q1\n- [x] 1. Requirement\n')
+  const missingClosure = await handleHook('stop', basePayload(fixture.cwd, {
+    turn_id: 'turn-1',
+    stop_hook_active: false,
+    last_assistant_message: 'The plugin implementation has been completed.',
+  }), { env: {}, dataDir: fixture.dataDir, now: () => 2_100 })
+  assert.equal(missingClosure.decision, 'block')
+  assert.match(missingClosure.reason, /QA closure/i)
+
+  const progress = await handleHook('stop', basePayload(fixture.cwd, {
+    turn_id: 'turn-1',
+    stop_hook_active: false,
+    last_assistant_message: 'Tests completed, but I am still reviewing the implementation.',
+  }), { env: {}, dataDir: fixture.dataDir, now: () => 2_200 })
+  assert.equal(progress, null)
+
+  await writeFile(ledgerPath, 'QA-Tier: Q0\n- [x] 1. Requirement\n')
+  await createRun({
+    cwd: fixture.cwd,
+    objective: 'Q0 closure',
+    runId: 'hook-qa',
+    qaTier: 'q0',
+    dataDir: fixture.dataDir,
+  })
+  await closeRun({ runId: 'hook-qa', solVerdict: 'accepted', dataDir: fixture.dataDir })
+  const accepted = await handleHook('stop', basePayload(fixture.cwd, {
+    turn_id: 'turn-1',
+    stop_hook_active: false,
+    last_assistant_message: 'Done. QA closure: .workflow/closure.json',
+  }), { env: {}, dataDir: fixture.dataDir, now: () => 2_300 })
+  assert.equal(accepted, null)
 })
 
 test('hooks auto-activate, honor opt-out, and retain explicit-token fallback', async () => {

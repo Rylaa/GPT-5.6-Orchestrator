@@ -13,13 +13,17 @@ import path from 'node:path'
 import test from 'node:test'
 
 import { resolveManagedAgentRole } from '../lib/routing.mjs'
+import { validateClosure } from '../lib/qa.mjs'
 import {
   buildCodexArguments,
+  closeRun,
   createRun,
   defaultDataDir,
   getRunStatus,
   launchWorker,
+  loadRun,
   materializeWorker,
+  runTestEvidence,
   runWorker,
   stopWorkers,
   waitForWorkers,
@@ -36,6 +40,12 @@ async function writeTask(cwd, name = 'task.md') {
   const taskPath = path.join(cwd, '.workflow', 'tasks', name)
   await writeFile(taskPath, 'Inspect package.json and return bounded evidence.\n')
   return taskPath
+}
+
+async function writeLedger(cwd, tier = 'Q1', status = 'x') {
+  const ledgerPath = path.join(cwd, '.workflow', 'LEDGER.md')
+  await writeFile(ledgerPath, `QA-Tier: ${tier}\n- [${status}] 1. Acceptance requirement\n`)
+  return ledgerPath
 }
 
 async function fakeCodex(root, { completed = true, exitCode = 0, delayMs = 0 } = {}) {
@@ -85,8 +95,8 @@ function runCli(args, env = {}) {
 test('builds exact model, effort, fast-tier, sandbox, and no-descendant Codex args', () => {
   const role = resolveManagedAgentRole('orchestrator_sol_specialist')
   const args = buildCodexArguments({ role, cwd: '/tmp/project', outputPath: '/tmp/result.md' })
-  assert.deepEqual(args.slice(0, 6), [
-    'exec', '--ephemeral', '--ignore-user-config', '--json', '--color', 'never',
+  assert.deepEqual(args.slice(0, 8), [
+    'exec', '--ephemeral', '--ignore-user-config', '--disable', 'remote_plugin', '--json', '--color', 'never',
   ])
   assert.equal(args[args.indexOf('-m') + 1], 'gpt-5.6-sol')
   assert.equal(args[args.indexOf('-s') + 1], 'workspace-write')
@@ -151,6 +161,31 @@ test('creates a Sol-controlled run and materializes bounded workers safely', asy
   }), /non-symlink/i)
 })
 
+test('rejects a symlinked run directory through both API and CLI access', async () => {
+  const { cwd, dataDir } = await makeWorkspace()
+  const runId = 'linked-run'
+  const outsideRun = await mkdtemp(path.join(os.tmpdir(), 'g56o-outside-run-'))
+  await mkdir(path.join(dataDir, 'runs'), { recursive: true })
+  await writeFile(path.join(outsideRun, 'run.json'), JSON.stringify({
+    schemaVersion: 1,
+    runId,
+    cwd,
+    qaTier: 'q0',
+    controller: { model: 'gpt-5.6-sol' },
+  }))
+  await symlink(outsideRun, path.join(dataDir, 'runs', runId))
+
+  await assert.rejects(
+    () => loadRun({ runId, dataDir }),
+    /symlink|trusted root|outside/i,
+  )
+  const cli = await runCli(['status', '--run', runId, '--json'], {
+    GPT56_ORCHESTRATOR_DATA_DIR: dataDir,
+  })
+  assert.equal(cli.code, 1)
+  assert.match(cli.stderr, /symlink|trusted root|outside/i)
+})
+
 test('runs a pinned worker and records durable runtime proof', async () => {
   const { cwd, dataDir } = await makeWorkspace()
   const taskFile = await writeTask(cwd)
@@ -186,6 +221,215 @@ test('runs a pinned worker and records durable runtime proof', async () => {
     runId: 'proof-run', workerId: 'gather', timeoutSeconds: 1, dataDir,
   })
   assert.equal(waited.selectedSuccessful, true)
+})
+
+test('records current tests, enforces tier review, closes QA, and detects staleness', async () => {
+  const { cwd, dataDir } = await makeWorkspace()
+  await writeFile(path.join(cwd, 'app.js'), 'export const ready = true\n')
+  await writeLedger(cwd, 'Q1')
+  const taskFile = await writeTask(cwd, 'review.md')
+  const run = await createRun({
+    cwd,
+    objective: 'Validate risk-based QA',
+    runId: 'qa-run',
+    qaTier: 'q1',
+    dataDir,
+  })
+  assert.equal(run.qaTier, 'q1')
+  const directTest = await runTestEvidence({
+    runId: run.runId,
+    testId: 'unit',
+    command: [process.execPath, '-e', 'process.exit(0)'],
+    dataDir,
+  })
+  assert.equal(directTest.status, 'passed')
+  assert.match(directTest.proofPath, /tests\/unit\/proof\.json$/)
+
+  await materializeWorker({
+    runId: run.runId,
+    workerId: 'review',
+    role: 'orchestrator_luna_reviewer',
+    taskFile,
+    dataDir,
+  })
+  const reviewerProof = await runWorker({
+    runId: run.runId,
+    workerId: 'review',
+    dataDir,
+    env: { ...process.env, GPT56_ORCHESTRATOR_CODEX_BIN: await fakeCodex(dataDir) },
+  })
+  assert.equal(reviewerProof.workspaceStable, true)
+
+  const reviewerPayload = JSON.parse(await readFile(reviewerProof.proofPath, 'utf8'))
+  const actualReviewerStartedAt = reviewerPayload.startedAt
+  reviewerPayload.startedAt = directTest.completedAt
+  await writeFile(reviewerProof.proofPath, JSON.stringify(reviewerPayload))
+  await assert.rejects(
+    () => closeRun({ runId: run.runId, solVerdict: 'accepted', dataDir }),
+    /strictly after direct tests/i,
+  )
+  reviewerPayload.startedAt = actualReviewerStartedAt
+  await writeFile(reviewerProof.proofPath, JSON.stringify(reviewerPayload))
+
+  const closure = await closeRun({
+    runId: run.runId,
+    solVerdict: 'accepted',
+    dataDir,
+  })
+  assert.equal(closure.qaTier, 'q1')
+  assert.deepEqual(closure.tests, [directTest.proofPath])
+  assert.deepEqual(closure.reviews, [reviewerProof.proofPath])
+  assert.equal((await validateClosure({ cwd, dataDir })).valid, true)
+
+  reviewerPayload.startedAt = directTest.completedAt
+  await writeFile(reviewerProof.proofPath, JSON.stringify(reviewerPayload))
+  const overlappingReview = await validateClosure({ cwd, dataDir })
+  assert.equal(overlappingReview.valid, false)
+  assert.match(overlappingReview.reason, /strictly after direct tests/i)
+  reviewerPayload.startedAt = actualReviewerStartedAt
+  await writeFile(reviewerProof.proofPath, JSON.stringify(reviewerPayload))
+
+  await writeFile(path.join(cwd, 'app.js'), 'export const ready = false\n')
+  const stale = await validateClosure({ cwd, dataDir })
+  assert.equal(stale.valid, false)
+  assert.match(stale.reason, /workspace changed|stale/i)
+})
+
+test('failed or stale tests cannot satisfy QA closure', async () => {
+  const { cwd, dataDir } = await makeWorkspace()
+  await writeFile(path.join(cwd, 'app.js'), 'export const ready = true\n')
+  await writeLedger(cwd, 'Q1')
+  await createRun({ cwd, objective: 'Reject failed QA', runId: 'qa-fail', qaTier: 'q1', dataDir })
+  const failed = await runTestEvidence({
+    runId: 'qa-fail',
+    testId: 'failed',
+    command: [process.execPath, '-e', 'process.exit(3)'],
+    dataDir,
+  })
+  assert.equal(failed.status, 'failed')
+  await assert.rejects(
+    () => closeRun({ runId: 'qa-fail', solVerdict: 'accepted', dataDir }),
+    /requires passing tests/i,
+  )
+})
+
+test('requires tests to start strictly after write workers finish', async () => {
+  const { cwd, dataDir } = await makeWorkspace()
+  await writeFile(path.join(cwd, 'app.js'), 'export const ready = true\n')
+  await writeLedger(cwd, 'Q1')
+  const taskFile = await writeTask(cwd, 'write.md')
+  await createRun({ cwd, objective: 'Order writer and tests', runId: 'qa-writer-order', qaTier: 'q1', dataDir })
+  await materializeWorker({
+    runId: 'qa-writer-order',
+    workerId: 'writer',
+    role: 'orchestrator_luna_worker',
+    taskFile,
+    allowWrite: true,
+    dataDir,
+  })
+  const writerProof = await runWorker({
+    runId: 'qa-writer-order',
+    workerId: 'writer',
+    dataDir,
+    env: { ...process.env, GPT56_ORCHESTRATOR_CODEX_BIN: await fakeCodex(dataDir) },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 2))
+  const directTest = await runTestEvidence({
+    runId: 'qa-writer-order',
+    testId: 'unit',
+    command: [process.execPath, '-e', 'process.exit(0)'],
+    dataDir,
+  })
+  const testPayload = JSON.parse(await readFile(directTest.proofPath, 'utf8'))
+  const actualTestStartedAt = testPayload.startedAt
+  testPayload.startedAt = writerProof.completedAt
+  await writeFile(directTest.proofPath, JSON.stringify(testPayload))
+  await assert.rejects(
+    () => closeRun({ runId: 'qa-writer-order', solVerdict: 'accepted', dataDir }),
+    /passing tests after write workers finish/i,
+  )
+  testPayload.startedAt = actualTestStartedAt
+  await writeFile(directTest.proofPath, JSON.stringify(testPayload))
+
+  await materializeWorker({
+    runId: 'qa-writer-order',
+    workerId: 'review',
+    role: 'orchestrator_luna_reviewer',
+    taskFile,
+    dataDir,
+  })
+  await runWorker({
+    runId: 'qa-writer-order',
+    workerId: 'review',
+    dataDir,
+    env: { ...process.env, GPT56_ORCHESTRATOR_CODEX_BIN: await fakeCodex(dataDir) },
+  })
+  await closeRun({ runId: 'qa-writer-order', solVerdict: 'accepted', dataDir })
+  assert.equal((await validateClosure({ cwd, dataDir })).valid, true)
+
+  testPayload.startedAt = writerProof.completedAt
+  await writeFile(directTest.proofPath, JSON.stringify(testPayload))
+  const reordered = await validateClosure({ cwd, dataDir })
+  assert.equal(reordered.valid, false)
+  assert.match(reordered.reason, /strictly after write workers/i)
+})
+
+test('Q3 requires Terra review followed by a Sol verifier', async () => {
+  const { cwd, dataDir } = await makeWorkspace()
+  await writeFile(path.join(cwd, 'critical.js'), 'export const guarded = true\n')
+  await writeLedger(cwd, 'Q3')
+  const taskFile = await writeTask(cwd, 'critical-review.md')
+  await createRun({ cwd, objective: 'Critical QA', runId: 'qa-q3', qaTier: 'q3', dataDir })
+  await runTestEvidence({
+    runId: 'qa-q3',
+    testId: 'critical',
+    command: [process.execPath, '-e', 'process.exit(0)'],
+    dataDir,
+  })
+  const codexBin = await fakeCodex(dataDir)
+  await materializeWorker({
+    runId: 'qa-q3',
+    workerId: 'terra-review',
+    role: 'orchestrator_terra_reviewer',
+    taskFile,
+    dataDir,
+  })
+  const terraProof = await runWorker({
+    runId: 'qa-q3',
+    workerId: 'terra-review',
+    dataDir,
+    env: { ...process.env, GPT56_ORCHESTRATOR_CODEX_BIN: codexBin },
+  })
+  await assert.rejects(
+    () => closeRun({ runId: 'qa-q3', solVerdict: 'accepted', dataDir }),
+    /requires orchestrator_sol_verifier/i,
+  )
+  await materializeWorker({
+    runId: 'qa-q3',
+    workerId: 'sol-verify',
+    role: 'orchestrator_sol_verifier',
+    taskFile,
+    dataDir,
+  })
+  const solProof = await runWorker({
+    runId: 'qa-q3',
+    workerId: 'sol-verify',
+    dataDir,
+    env: { ...process.env, GPT56_ORCHESTRATOR_CODEX_BIN: codexBin },
+  })
+  const solPayload = JSON.parse(await readFile(solProof.proofPath, 'utf8'))
+  const actualSolStartedAt = solPayload.startedAt
+  solPayload.startedAt = terraProof.completedAt
+  await writeFile(solProof.proofPath, JSON.stringify(solPayload))
+  await assert.rejects(
+    () => closeRun({ runId: 'qa-q3', solVerdict: 'accepted', dataDir }),
+    /strictly after Terra review/i,
+  )
+  solPayload.startedAt = actualSolStartedAt
+  await writeFile(solProof.proofPath, JSON.stringify(solPayload))
+  const closure = await closeRun({ runId: 'qa-q3', solVerdict: 'accepted', dataDir })
+  assert.equal(closure.qaTier, 'q3')
+  assert.equal(closure.reviews.length, 2)
 })
 
 test('fails closed when Codex output lacks a completed runtime event', async () => {
@@ -256,6 +500,29 @@ test('CLI exposes roles and rejects malformed commands', async () => {
   const unknown = await runCli(['explode'])
   assert.equal(unknown.code, 1)
   assert.match(unknown.stdout, /GPT-5\.6 Orchestrator Codex worker controller/)
+})
+
+test('CLI runs test evidence and writes an accepted Q0 closure', async () => {
+  const { cwd, dataDir } = await makeWorkspace()
+  await writeFile(path.join(cwd, 'app.js'), 'export const ready = true\n')
+  await writeLedger(cwd, 'Q0')
+  const env = { GPT56_ORCHESTRATOR_DATA_DIR: dataDir }
+  const created = await runCli([
+    'create', '--cwd', cwd, '--objective', 'CLI QA', '--qa-tier', 'q0', '--run-id', 'qa-cli',
+  ], env)
+  assert.equal(created.code, 0)
+  assert.equal(JSON.parse(created.stdout).qaTier, 'q0')
+  const tested = await runCli([
+    'test', '--run', 'qa-cli', '--test-id', 'smoke', '--',
+    process.execPath, '-e', 'process.exit(0)',
+  ], env)
+  assert.equal(tested.code, 0)
+  assert.equal(JSON.parse(tested.stdout).status, 'passed')
+  const closed = await runCli([
+    'close', '--run', 'qa-cli', '--sol-verdict', 'accepted',
+  ], env)
+  assert.equal(closed.code, 0)
+  assert.equal(JSON.parse(closed.stdout).status, 'accepted')
 })
 
 test('run and worker validation covers automatic IDs, empty runs, duplicates, and write approval', async () => {

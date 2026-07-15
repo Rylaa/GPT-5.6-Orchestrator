@@ -1,6 +1,6 @@
 {
   "name": "codex-sol-fusion",
-  "version": "0.1.0+codex.20260714134917",
+  "version": "0.1.0+codex.20260715080039",
   "description": "Sol Max directs dynamic, task-shaped Luna, Terra, and Sol Codex subagents.",
   "author": {
     "name": "Yusuf"
@@ -21,7 +21,7 @@
     "defaultPrompt": [
       "Keep GPT-5.6 Sol at max in the main session and decompose every request into task-shaped lanes before acting.",
       "Have main-session Sol clarify material ambiguity, decide, dynamically launch and control pinned Luna, Terra, or Sol Codex subagents, and retain every consequential decision and final acceptance.",
-      "Verify worker proof, direct tests, review evidence, and the current workflow ledger before closing work."
+      "Select Q0-Q3 risk-based QA and verify current test, review, ledger, workspace-digest, and Sol-acceptance evidence before closing work."
     ]
   }
 }

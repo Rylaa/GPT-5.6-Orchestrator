@@ -67,10 +67,12 @@ $gpt-5-6-orchestrator <your task>
 The Sol main session uses the bundled controller. It creates one durable run, opens workers only when useful, and can inspect, wait for, or stop them at any time.
 
 ```sh
-node scripts/orchestrator.mjs create --cwd "$PWD" --objective "audit and fix the target"
+node scripts/orchestrator.mjs create --cwd "$PWD" --objective "audit and fix the target" --qa-tier q2
 node scripts/orchestrator.mjs spawn --run <run-id> --worker scan --role orchestrator_terra_explorer --task-file .workflow/tasks/scan.md
+node scripts/orchestrator.mjs test --run <run-id> --test-id unit -- npm test
 node scripts/orchestrator.mjs status --run <run-id> --json
 node scripts/orchestrator.mjs wait --run <run-id> --worker scan --timeout-seconds 30 --json
+node scripts/orchestrator.mjs close --run <run-id> --sol-verdict accepted
 node scripts/orchestrator.mjs stop --run <run-id> --worker scan
 ```
 
@@ -91,9 +93,20 @@ Write workers additionally require `--allow-write`. Task files must be regular n
 
 The main session can add subagents as evidence changes, like Claude Code Dynamic Workflows with a lead session and dynamic workers. Parallelism is limited to independent discovery or disjoint file ownership. Prompt length controls ledger policy, not model routing.
 
+## Risk-based QA
+
+```text
+Q0  tiny/read-only       Sol inline self-check; no QA worker
+Q1  bounded code         current test -> Luna checklist review
+Q2  cross-file/root cause current test -> Terra cross-file review
+Q3  critical/high risk   current test -> Terra review -> Sol verifier
+```
+
+Sol selects the tier after clarification, records `QA-Tier: QN` in the ledger, and uses existing reviewers rather than an always-on QA agent. Tests and reviews are bound to a workspace digest; `.workflow` metadata and a later git commit do not invalidate them. The lightweight Stop hook runs no tests. It blocks only a ledger-backed completion claim whose ledger is open or whose `.workflow/closure.json` is missing, stale, lacks the tier-required proof and Sol acceptance, or does not match the controller's private receipt.
+
 ## Runtime proof
 
-Each worker is a lean, isolated background `codex exec` subagent pinned to its exact model and effort on service tier `fast`. Unrelated user config is skipped, automatic Orchestrator hooks are disabled inside worker runtimes, and required settings are passed explicitly. It records `events.jsonl`, `result.md`, `stderr.log`, and `proof.json`. Completion requires a non-empty Codex thread ID, a completed turn event, a zero exit code, and a non-empty result. Process launch alone is never treated as success. No tmux or daemon is required.
+Each worker is a lean, isolated background `codex exec` subagent pinned to its exact model and effort on service tier `fast`. Unrelated user config is skipped, the remote plugin catalog is disabled to preserve the worker skill-context budget, automatic Orchestrator hooks are disabled inside worker runtimes, and required settings are passed explicitly. It records `events.jsonl`, `result.md`, `stderr.log`, and `proof.json`. Completion requires a non-empty Codex thread ID, a completed turn event, a zero exit code, and a non-empty result. Reviewer proof also requires a stable workspace. Process launch alone is never treated as success. No tmux or daemon is required.
 
 On Codex CLI 0.144.4, the default direct collaboration schema cannot pin a named role, model, or effort from a Sol root. The bundled Codex subagent controller is the current exact-routing path; native subagents become preferable when the active schema can prove those pins. Generic unpinned children fail closed.
 

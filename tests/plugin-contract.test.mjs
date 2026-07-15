@@ -36,6 +36,7 @@ test('manifest exposes GPT-5.6 Orchestrator while preserving legacy install iden
   assert.match(prompt, /decompose every request/i)
   assert.match(prompt, /clarify material ambiguity/i)
   assert.match(prompt, /dynamic/i)
+  assert.match(prompt, /Q0-Q3 risk-based QA/i)
   assert.doesNotMatch(prompt, /\$codex-sol-fusion/)
 })
 
@@ -60,6 +61,7 @@ test('hook manifest uses PLUGIN_ROOT and points to the renamed handler', async (
   assert.match(handler, /\$gpt-5-6-orchestrator/)
   assert.match(handler, /native spawn surface cannot prove an exact named model and effort/i)
   assert.match(handler, /proof\.json/)
+  assert.match(handler, /validateClosure/)
 })
 
 test('skill defines a Sol-main-session dynamic workflow', async () => {
@@ -74,7 +76,9 @@ test('skill defines a Sol-main-session dynamic workflow', async () => {
   assert.match(skill, /There is no worker judge/i)
   assert.match(skill, /Sol Max main session is the judge/i)
   assert.match(skill, /Claude Code Dynamic Workflows/i)
-  assert.match(skill, /three verification cycles/i)
+  assert.match(skill, /Risk-based QA/i)
+  assert.match(skill, /Q0.*Q1.*Q2.*Q3/is)
+  assert.match(skill, /\.workflow\/closure\.json/)
   assert.match(skill, /activates the workflow automatically for every main-session prompt/i)
   assert.match(skill, /Clarification gate/i)
   assert.match(skill, /Workers never ask the user/i)
@@ -89,7 +93,7 @@ test('skill defines a Sol-main-session dynamic workflow', async () => {
     'orchestrator_sol_specialist',
     'orchestrator_sol_verifier',
   ]) assert.match(skill, new RegExp(role))
-  assert.doesNotMatch(metadata, /default_prompt:.*\$gpt-5-6-orchestrator/)
+  assert.match(metadata, /default_prompt:.*\$gpt-5-6-orchestrator/)
   assert.match(metadata, /allow_implicit_invocation:\s*true/)
 })
 
@@ -135,6 +139,10 @@ test('README is concise and shows Sol controlling dynamic Codex subagents', asyn
   assert.match(readme, /\$gpt-5-6-orchestrator/)
   assert.match(readme, /every main-session prompt automatically/i)
   assert.match(readme, /Codex plugin installation does not run lifecycle scripts/i)
+  assert.match(readme, /Risk-based QA/i)
+  assert.match(readme, /Q0.*inline self-check/i)
+  assert.match(readme, /closure\.json/i)
+  assert.match(readme, /private receipt/i)
   assert.match(readme, /codex -m gpt-5\.6-sol.*model_reasoning_effort/)
   assert.match(readme, /node scripts\/orchestrator\.mjs spawn/)
   assert.match(readme, /proof\.json/)
@@ -154,6 +162,9 @@ test('controller requires proof, bounded writes, and no descendants', async () =
   assert.match(controller, /requires explicit --allow-write approval/i)
   assert.match(controller, /features\.multi_agent=false/)
   assert.match(controller, /GPT56_ORCHESTRATOR_DISABLE:\s*'1'/)
+  assert.match(controller, /runTestEvidence/)
+  assert.match(controller, /closeRun/)
+  assert.match(controller, /closure-receipt\.json/)
   assert.match(controller, /runtimeCompleted/)
   assert.match(controller, /threadId/)
   assert.match(controller, /serviceTier: 'fast'/)
@@ -174,6 +185,7 @@ test('source attribution and policy files contain no obvious secrets', async () 
     skillPath,
     'scripts/manage-agent-profiles.mjs',
     'scripts/orchestrator.mjs',
+    'lib/qa.mjs',
   ]
   const content = (await Promise.all(files.map(read))).join('\n')
   assert.doesNotMatch(content, /sk-[A-Za-z0-9_-]{20,}/)
