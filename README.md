@@ -1,10 +1,10 @@
 # GPT-5.6 Orchestrator
 
-### Sol Max leads. The task chooses Luna, Terra, or Sol; every worker reasons at max.
+### Sol leads. The task chooses Luna, Terra, or Sol; Sol effort is configurable.
 
 ```text
 +------------------------------------------------------------------+
-|                    SOL MAX / MAIN SESSION                        |
+|                       SOL / MAIN SESSION                         |
 |  understands -> decides -> assigns -> monitors -> accepts        |
 +-------------------------------+----------------------------------+
                                 |
@@ -17,7 +17,7 @@
                       evidence -> Sol acceptance
 ```
 
-This is a Codex-only Orchestrator, not a model fusion. GPT-5.6 Sol at `max` stays in the main interactive Codex session, owns planning and consequential decisions, and accepts the result. It dynamically opens bounded Luna, Terra, or additional Sol Codex workers only when useful.
+This is a Codex-only Orchestrator, not a model fusion. GPT-5.6 Sol stays in the main interactive Codex session, owns planning and consequential decisions, and accepts the result. It dynamically opens bounded Luna, Terra, or additional Sol Codex workers only when useful. Sol defaults to `high`; choose `low`, `medium`, `high`, `xhigh`, or `max` according to the task. Luna and Terra workers remain at `max`.
 
 Inspired by [Rylaa/fable5-orchestrator](https://github.com/Rylaa/fable5-orchestrator).
 
@@ -29,20 +29,20 @@ Inspired by [Rylaa/fable5-orchestrator](https://github.com/Rylaa/fable5-orchestr
 | `orchestrator_luna_worker` | gpt-5.6-luna | max | workspace-write |
 | `orchestrator_terra_explorer` | gpt-5.6-terra | max | read-only |
 | `orchestrator_terra_worker` | gpt-5.6-terra | max | workspace-write |
-| `orchestrator_sol_specialist` | gpt-5.6-sol | max | workspace-write |
+| `orchestrator_sol_specialist` | gpt-5.6-sol | configured (default high) | workspace-write |
 
 There is no worker judge and no automatic QA, reviewer, or verifier stage. Fresh-eyes inspection is an optional, risk-triggered closure choice owned by main Sol, with at most three verify/fix cycles. It is never a mandatory controller verdict or a retired worker role.
 
 ## Quickstart
 
-Install from a checkout registered in your personal Codex marketplace. The legacy package ID remains `codex-sol-fusion` so existing installations update in place.
+Install from a checkout registered in your personal Codex marketplace.
 
 ```sh
-codex plugin add codex-sol-fusion@personal
-codex -m gpt-5.6-sol -c 'model_reasoning_effort="max"' -c 'service_tier="fast"'
+codex plugin add gpt-5-6-orchestrator@personal
+codex -m gpt-5.6-sol -c 'model_reasoning_effort="high"' -c 'service_tier="fast"'
 ```
 
-Trust the bundled hooks after inspecting `/hooks`; start a fresh Sol Max session after trust. Automatic activation applies to main-session prompts. Set `GPT56_ORCHESTRATOR_AUTO=0` to opt out, or use `$gpt-5-6-orchestrator <your task>` for one explicit session. `GPT56_ORCHESTRATOR_DISABLE=1` disables plugin hooks.
+Trust the bundled hooks after inspecting `/hooks`; start a fresh Sol session after trust. Automatic activation applies to main-session prompts. Set `GPT56_ORCHESTRATOR_AUTO=0` to opt out, or use `$gpt-5-6-orchestrator <your task>` for one explicit session. `GPT56_ORCHESTRATOR_DISABLE=1` disables plugin hooks.
 
 Codex plugin installation does not run lifecycle scripts or rewrite `~/.codex/AGENTS.md`.
 The plugin skill and hooks carry the runtime policy. `AGENTS.md` is Codex's durable
@@ -54,12 +54,19 @@ the checkout or installed plugin root:
 
 ```sh
 node scripts/manage-agent-profiles.mjs install
+node scripts/manage-agent-profiles.mjs install --sol-effort medium
 ```
+
+When run from the installed plugin, the manager reads the same Sol setting as the
+controller. An explicit `--sol-effort` wins and is useful from a source checkout.
 
 ## Controller
 
 ```sh
+node scripts/orchestrator.mjs config --sol-effort high
+node scripts/orchestrator.mjs config
 node scripts/orchestrator.mjs create --cwd "$PWD" --objective "audit and fix the target"
+node scripts/orchestrator.mjs create --cwd "$PWD" --objective "critical migration" --sol-effort max
 node scripts/orchestrator.mjs spawn --run <run-id> --worker scan --role orchestrator_terra_explorer --task-file .workflow/tasks/scan.md --execution-timeout-seconds 1800
 node scripts/orchestrator.mjs status --run <run-id> --json
 node scripts/orchestrator.mjs wait --run <run-id> --worker scan --timeout-seconds 30 --json
@@ -67,6 +74,21 @@ node scripts/orchestrator.mjs stop --run <run-id> --worker scan
 node scripts/orchestrator.mjs data-dir
 node scripts/orchestrator.mjs prune --older-than-hours 168
 ```
+
+The persistent plugin setting controls the policy injected by hooks, each run's
+controller contract, and delegated Sol specialists. Precedence is a run-level
+`--sol-effort`, then `GPT56_ORCHESTRATOR_SOL_EFFORT`, then private
+`settings.json`, then the `high` default. `ultra` is intentionally excluded:
+Codex Ultra performs its own delegation, while this plugin already owns worker
+routing.
+
+Hooks cannot inspect or change the reasoning level of an already-running main
+chat. Use `/reasoning` for the current chat. For a durable Codex default, set
+`model_reasoning_effort = "high"` in `~/.codex/config.toml`; for one launch, use
+the `codex -m ... -c ...` command above. Select the lowest level that reliably
+handles the task: `medium` for routine work, `high` for complex implementation,
+`xhigh` for difficult cross-system reasoning, and `max` only for the hardest
+high-consequence work.
 
 An installed controller derives the same plugin-managed data root that hooks use;
 `GPT56_ORCHESTRATOR_DATA_DIR` remains the explicit standalone/test override.
@@ -96,7 +118,7 @@ The controller captures every worker's final five-field response in a private `r
 
 ## Native visibility and proof
 
-Native Codex subagents appear as Desktop threads, through CLI `/agent`, or in the IDE background-agent panel. Those native children are not substituted for named lanes while the active tool schema cannot prove exact role, model, and effort pins. The controller launches logged `codex exec` workers with requested model, max effort, sandbox, and fast-tier arguments. Matching `proof.json` schema v3 separates that requested launch contract from runtime-observed `thread.started` and `turn.completed` events; current events do not attest model or effort. Completion also requires zero exit, an exact non-empty five-field report with digest, valid ownership evidence, native multi-agent spawning disabled, plugin discovery disabled, and Orchestrator hooks disabled. Schema-v2 proofs remain readable for compatibility. Process launch alone is not success, and main Sol still owns semantic acceptance.
+Native Codex subagents appear as Desktop threads, through CLI `/agent`, or in the IDE background-agent panel. Those native children are not substituted for named lanes while the active tool schema cannot prove exact role, model, and effort pins. The controller launches logged `codex exec` workers with requested model, selected effort, sandbox, and fast-tier arguments. Matching `proof.json` schema v3 separates that requested launch contract from runtime-observed `thread.started` and `turn.completed` events; current events do not attest model or effort. Completion also requires zero exit, an exact non-empty five-field report with digest, valid ownership evidence, native multi-agent spawning disabled, plugin discovery disabled, and Orchestrator hooks disabled. Schema-v2 proofs remain readable for compatibility. Process launch alone is not success, and main Sol still owns semantic acceptance.
 
 ## Development checks
 

@@ -108,8 +108,9 @@ test('active Sol prompts establish main-session authority and exact subagent pro
   const activation = await submitPrompt(fixture)
   const context = activation.hookSpecificOutput.additionalContext
   assert.match(context, /Detected the required Sol main model/i)
-  assert.match(context, /reasoning effort is max/i)
-  assert.match(context, /Sol at max in the main session/i)
+  assert.match(context, /plugin target is reasoning effort high/i)
+  assert.match(context, /configured high reasoning target/i)
+  assert.match(context, /hooks cannot inspect or change the active chat reasoning level/i)
   assert.match(context, /bundled Codex subagent controller/i)
   assert.match(context, /non-empty thread ID/i)
   assert.match(context, /no separate QA stage/i)
@@ -117,6 +118,26 @@ test('active Sol prompts establish main-session authority and exact subagent pro
   assert.match(context, /Decompose every request into task-shaped lanes/i)
   assert.match(context, /only the main Sol session asks concise clarification/i)
   assert.match(context, /Workers never ask the user/i)
+})
+
+test('configured Sol effort is injected into main and delegated Sol policy', async () => {
+  const fixture = await makeFixture()
+  const activation = await submitPrompt(fixture, {
+    env: { GPT56_ORCHESTRATOR_SOL_EFFORT: 'medium' },
+  })
+  const context = activation.hookSpecificOutput.additionalContext
+  assert.match(context, /reasoning effort medium/i)
+  assert.match(context, /delegated Sol specialists use the configured medium effort/i)
+  const state = await readSessionState(fixture.dataDir, 'session-1')
+  assert.equal(state.currentTurn.solEffort, 'medium')
+  assert.equal(state.currentTurn.solEffortSource, 'environment')
+
+  const managed = await handleHook('subagent-start', basePayload(fixture.cwd, {
+    turn_id: 'turn-1',
+    agent_id: 'agent-sol',
+    agent_type: 'orchestrator_sol_specialist',
+  }), { env: {}, dataDir: fixture.dataDir, now: () => 2_000 })
+  assert.match(managed.hookSpecificOutput.additionalContext, /expects gpt-5\.6-sol at medium/i)
 })
 
 test('SessionStart and PostCompact rehydrate policy only for active main sessions', async () => {
@@ -149,7 +170,7 @@ test('Terra, Luna, and unknown roots are rejected as Orchestrator chairs', async
     const fixture = await makeFixture()
     const output = await submitPrompt(fixture, { turnId: 'turn-' + model, model })
     assert.match(output.hookSpecificOutput.additionalContext, /not a valid Orchestrator chair/i)
-    assert.match(output.hookSpecificOutput.additionalContext, /restart.*GPT-5\.6 Sol at max/i)
+    assert.match(output.hookSpecificOutput.additionalContext, /restart.*GPT-5\.6 Sol.*reasoning effort high/i)
   }
 })
 
@@ -235,8 +256,8 @@ test('SubagentStart defense-in-depth distinguishes managed and unpinned roles', 
     agent_id: 'agent-sol',
     agent_type: 'orchestrator_sol_specialist',
   }), { env: {}, dataDir: fixture.dataDir, now: () => 2_000 })
-  assert.match(managed.hookSpecificOutput.additionalContext, /expects gpt-5\.6-sol at max/i)
-  assert.match(managed.hookSpecificOutput.additionalContext, /return control to the Sol Max main session/i)
+  assert.match(managed.hookSpecificOutput.additionalContext, /expects gpt-5\.6-sol at high/i)
+  assert.match(managed.hookSpecificOutput.additionalContext, /return control to the main Sol session/i)
 
   const unpinned = await handleHook('subagent-start', basePayload(fixture.cwd, {
     turn_id: 'turn-1',

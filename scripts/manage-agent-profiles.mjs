@@ -14,6 +14,15 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
+import { resolveOrchestratorDataDir } from '../lib/data-dir.mjs'
+import {
+  DEFAULT_SOL_EFFORT,
+  normalizeSolEffort,
+  readOrchestratorSettings,
+} from '../lib/settings.mjs'
+
+const SCRIPT_PATH = fileURLToPath(import.meta.url)
+
 export const AGENT_PROFILE_FILES = Object.freeze([
   'orchestrator-luna-gatherer.toml',
   'orchestrator-luna-worker.toml',
@@ -28,20 +37,7 @@ export const RETIRED_AGENT_PROFILE_FILES = Object.freeze([
   'orchestrator-sol-verifier.toml',
 ])
 
-export const LEGACY_AGENT_PROFILE_FILES = Object.freeze([
-  'csf-luna-gatherer.toml',
-  'csf-luna-worker.toml',
-  'csf-luna-reviewer.toml',
-  'csf-terra-explorer.toml',
-  'csf-terra-worker.toml',
-  'csf-terra-reviewer.toml',
-  'csf-sol-judge.toml',
-  'csf-sol-specialist.toml',
-  'csf-sol-verifier.toml',
-])
-
 const MANAGED_MARKER = '# Managed by gpt-5-6-orchestrator.'
-const LEGACY_MANAGED_MARKER = '# Managed by codex-sol-fusion.'
 
 async function optionalStat(targetPath) {
   try {
@@ -74,12 +70,21 @@ function profilePaths({ codexHome, pluginRoot, filename }) {
   }
 }
 
-async function readManagedSource(sourcePath) {
+async function readManagedSource(sourcePath, solEffort = DEFAULT_SOL_EFFORT) {
   const source = await readFile(sourcePath, 'utf8')
   if (!source.startsWith(`${MANAGED_MARKER}\n`)) {
     throw new Error(`Agent profile is missing its managed marker: ${sourcePath}`)
   }
-  return source
+  if (path.basename(sourcePath) !== 'orchestrator-sol-specialist.toml') return source
+  const normalizedEffort = normalizeSolEffort(solEffort)
+  const rendered = source.replace(
+    'model_reasoning_effort = "high"',
+    `model_reasoning_effort = "${normalizedEffort}"`,
+  )
+  if (rendered === source && normalizedEffort !== DEFAULT_SOL_EFFORT) {
+    throw new Error(`Sol agent profile has no configurable effort marker: ${sourcePath}`)
+  }
+  return rendered
 }
 
 async function writeAtomic(targetPath, content) {
@@ -95,7 +100,11 @@ async function writeAtomic(targetPath, content) {
   }
 }
 
-export async function installAgentProfiles({ codexHome, pluginRoot }) {
+export async function installAgentProfiles({
+  codexHome,
+  pluginRoot,
+  solEffort = DEFAULT_SOL_EFFORT,
+}) {
   const agentsDir = await resolveAgentDirectory(codexHome, { create: true })
   const outcome = {
     installed: [],
@@ -103,13 +112,11 @@ export async function installAgentProfiles({ codexHome, pluginRoot }) {
     unchanged: [],
     removedRetired: [],
     skippedRetired: [],
-    removedLegacy: [],
-    skippedLegacy: [],
   }
 
   for (const filename of AGENT_PROFILE_FILES) {
     const { sourcePath, targetPath } = profilePaths({ codexHome, pluginRoot, filename })
-    const source = await readManagedSource(sourcePath)
+    const source = await readManagedSource(sourcePath, solEffort)
     const targetInfo = await optionalStat(targetPath)
 
     if (targetInfo?.isSymbolicLink()) {
@@ -154,28 +161,15 @@ export async function installAgentProfiles({ codexHome, pluginRoot }) {
     outcome.removedRetired.push(filename)
   }
 
-  for (const filename of LEGACY_AGENT_PROFILE_FILES) {
-    const targetPath = path.join(agentsDir, filename)
-    const targetInfo = await optionalStat(targetPath)
-    if (!targetInfo) continue
-    if (!targetInfo.isFile() || targetInfo.isSymbolicLink()) {
-      outcome.skippedLegacy.push(filename)
-      continue
-    }
-    const current = await readFile(targetPath, 'utf8')
-    if (!current.startsWith(`${LEGACY_MANAGED_MARKER}\n`)) {
-      outcome.skippedLegacy.push(filename)
-      continue
-    }
-    await unlink(targetPath)
-    outcome.removedLegacy.push(filename)
-  }
-
   await chmod(agentsDir, 0o700)
   return outcome
 }
 
-export async function checkAgentProfiles({ codexHome, pluginRoot }) {
+export async function checkAgentProfiles({
+  codexHome,
+  pluginRoot,
+  solEffort = DEFAULT_SOL_EFFORT,
+}) {
   const missing = []
   const changed = []
   const retired = []
@@ -183,7 +177,7 @@ export async function checkAgentProfiles({ codexHome, pluginRoot }) {
 
   for (const filename of AGENT_PROFILE_FILES) {
     const { sourcePath, targetPath } = profilePaths({ codexHome, pluginRoot, filename })
-    const source = await readManagedSource(sourcePath)
+    const source = await readManagedSource(sourcePath, solEffort)
     if (!agentsDir) {
       missing.push(filename)
       continue
@@ -227,7 +221,6 @@ export async function removeAgentProfiles({ codexHome }) {
   for (const filename of [
     ...AGENT_PROFILE_FILES,
     ...RETIRED_AGENT_PROFILE_FILES,
-    ...LEGACY_AGENT_PROFILE_FILES,
   ]) {
     const targetPath = path.join(agentsDir, filename)
     const targetInfo = await optionalStat(targetPath)
@@ -237,10 +230,7 @@ export async function removeAgentProfiles({ codexHome }) {
       continue
     }
     const current = await readFile(targetPath, 'utf8')
-    if (
-      !current.startsWith(`${MANAGED_MARKER}\n`)
-      && !current.startsWith(`${LEGACY_MANAGED_MARKER}\n`)
-    ) {
+    if (!current.startsWith(`${MANAGED_MARKER}\n`)) {
       skipped.push(filename)
       continue
     }
@@ -256,17 +246,30 @@ function parseCliArguments(argv) {
   const homeIndex = rest.indexOf('--codex-home')
   const codexHome = homeIndex >= 0 ? rest[homeIndex + 1] : process.env.CODEX_HOME
   if (homeIndex >= 0 && !codexHome) throw new Error('--codex-home requires a path')
-  return { action, codexHome: path.resolve(codexHome || path.join(os.homedir(), '.codex')) }
+  const effortIndex = rest.indexOf('--sol-effort')
+  const solEffort = effortIndex >= 0 ? rest[effortIndex + 1] : null
+  if (effortIndex >= 0 && !solEffort) throw new Error('--sol-effort requires a value')
+  return {
+    action,
+    codexHome: path.resolve(codexHome || path.join(os.homedir(), '.codex')),
+    solEffort: solEffort ? normalizeSolEffort(solEffort) : null,
+  }
 }
 
 async function main() {
-  const { action, codexHome } = parseCliArguments(process.argv.slice(2))
-  const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+  const { action, codexHome, solEffort: explicitSolEffort } = parseCliArguments(process.argv.slice(2))
+  const pluginRoot = path.resolve(path.dirname(SCRIPT_PATH), '..')
+  let solEffort = explicitSolEffort ?? DEFAULT_SOL_EFFORT
+  if (action !== 'remove' && explicitSolEffort === null) {
+    const dataDir = resolveOrchestratorDataDir({ env: process.env, modulePath: SCRIPT_PATH })
+    solEffort = (await readOrchestratorSettings(dataDir)).solEffort
+  }
   let result
-  if (action === 'install') result = await installAgentProfiles({ codexHome, pluginRoot })
-  else if (action === 'check') result = await checkAgentProfiles({ codexHome, pluginRoot })
+  if (action === 'install') result = await installAgentProfiles({ codexHome, pluginRoot, solEffort })
+  else if (action === 'check') result = await checkAgentProfiles({ codexHome, pluginRoot, solEffort })
   else if (action === 'remove') result = await removeAgentProfiles({ codexHome })
   else throw new Error(`Unknown action: ${action}. Use install, check, or remove.`)
+  if (action !== 'remove') result = { ...result, solEffort }
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`)
 }
 

@@ -11,7 +11,7 @@ test('resolves explicit, controller, and hook data roots in strict precedence or
   const homeDir = '/tmp/g56o-home'
   const modulePath = path.join(
     homeDir,
-    '.codex/plugins/cache/personal/codex-sol-fusion/0.2.0/scripts/orchestrator.mjs',
+    '.codex/plugins/cache/personal/gpt-5-6-orchestrator/0.3.0/scripts/orchestrator.mjs',
   )
   assert.equal(resolveOrchestratorDataDir({
     explicit: '/tmp/explicit',
@@ -35,9 +35,9 @@ test('derives the same plugin-managed root from an installed cache path', () => 
   const homeDir = '/tmp/g56o-home'
   const modulePath = path.join(
     homeDir,
-    '.codex/plugins/cache/personal/codex-sol-fusion/0.2.0/scripts/orchestrator.mjs',
+    '.codex/plugins/cache/personal/gpt-5-6-orchestrator/0.3.0/scripts/orchestrator.mjs',
   )
-  const expected = path.join(homeDir, '.codex/plugins/data/codex-sol-fusion-personal')
+  const expected = path.join(homeDir, '.codex/plugins/data/gpt-5-6-orchestrator-personal')
   assert.equal(deriveInstalledPluginDataDir({ modulePath, homeDir }), expected)
   assert.equal(resolveOrchestratorDataDir({ env: {}, modulePath, homeDir }), expected)
 })
@@ -51,13 +51,13 @@ test('accepts a Codex semver cachebuster in the installed cache path', () => {
       'plugins',
       'cache',
       'personal',
-      'codex-sol-fusion',
-      '0.2.0+codex.20260720133451',
+      'gpt-5-6-orchestrator',
+      '0.3.0+codex.20260720133451',
       'scripts',
       'orchestrator.mjs',
     ),
     homeDir,
-  }), path.join(homeDir, '.codex', 'plugins', 'data', 'codex-sol-fusion-personal'))
+  }), path.join(homeDir, '.codex', 'plugins', 'data', 'gpt-5-6-orchestrator-personal'))
 })
 
 test('keeps a standalone fallback when the module is not an installed plugin', () => {

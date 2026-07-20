@@ -75,11 +75,11 @@ test('uses profile defaults and bounded threshold overrides', () => {
 test('allowlists model and effort combinations', () => {
   assert.deepEqual(
     resolveReasoningRequest({ model: 'gpt-5.6-sol' }),
-    { model: 'gpt-5.6-sol', effort: 'max' },
+    { model: 'gpt-5.6-sol', effort: 'high' },
   )
-  assert.deepEqual(
-    resolveReasoningRequest({ model: 'gpt-5.6-sol', effort: 'ultra' }),
-    { model: 'gpt-5.6-sol', effort: 'ultra' },
+  assert.throws(
+    () => resolveReasoningRequest({ model: 'gpt-5.6-sol', effort: 'ultra' }),
+    /does not support.*ultra/i,
   )
   assert.deepEqual(
     resolveReasoningRequest({ model: 'gpt-5.6-terra' }),

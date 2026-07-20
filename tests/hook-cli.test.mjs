@@ -46,7 +46,7 @@ test('hook CLI consumes Codex JSON and emits schema-valid JSON', async () => {
   assert.equal(result.code, 0)
   const output = JSON.parse(result.stdout)
   assert.equal(output.hookSpecificOutput.hookEventName, 'UserPromptSubmit')
-  assert.match(output.hookSpecificOutput.additionalContext, /Sol at max/i)
+  assert.match(output.hookSpecificOutput.additionalContext, /Sol at the configured high reasoning target/i)
   assert.match(output.hookSpecificOutput.additionalContext, /Decompose every request/i)
 })
 

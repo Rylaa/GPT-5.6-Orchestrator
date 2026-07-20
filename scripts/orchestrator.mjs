@@ -47,6 +47,13 @@ import {
   readLatestActivity,
 } from '../lib/runtime-events.mjs'
 import {
+  DEFAULT_SOL_EFFORT,
+  normalizeSolEffort,
+  readOrchestratorSettings,
+  SUPPORTED_SOL_EFFORTS,
+  writeOrchestratorSettings,
+} from '../lib/settings.mjs'
+import {
   captureWorkspaceSnapshot,
   resolveGitWorkspace,
   validateSnapshotOwnership,
@@ -65,7 +72,6 @@ const PROCESS_HEARTBEAT_STALE_MS = 10_000
 const CONTROLLER_LOCK_STALE_MS = 30_000
 const CONTROLLER_CONTRACT = Object.freeze({
   model: 'gpt-5.6-sol',
-  effort: 'max',
   authority: 'main-session',
   attestation: 'declared-main-session-contract',
 })
@@ -91,7 +97,7 @@ function assertControllerContract(manifest) {
   if (
     !controller
     || controller.model !== CONTROLLER_CONTRACT.model
-    || controller.effort !== CONTROLLER_CONTRACT.effort
+    || !SUPPORTED_SOL_EFFORTS.includes(controller.effort)
     || controller.authority !== CONTROLLER_CONTRACT.authority
     || (manifest.schemaVersion >= 2 && controller.attestation !== CONTROLLER_CONTRACT.attestation)
     || manifest.workerBackend !== WORKER_BACKEND
@@ -242,7 +248,7 @@ export async function createRun(options) {
   return withControllerLock(dataDir, () => createRunUnlocked({ ...options, dataDir }))
 }
 
-async function createRunUnlocked({ cwd, objective, runId, dataDir }) {
+async function createRunUnlocked({ cwd, objective, runId, solEffort, env = process.env, dataDir }) {
   const resolvedCwd = await realpath(path.resolve(cwd || process.cwd()))
   const cwdInfo = await lstat(resolvedCwd)
   if (!cwdInfo.isDirectory()) throw new Error(`Working directory is not a directory: ${resolvedCwd}`)
@@ -260,6 +266,10 @@ async function createRunUnlocked({ cwd, objective, runId, dataDir }) {
   if (await optionalStat(targetRunDir)) throw new Error(`Run already exists: ${normalizedRunId}`)
   await mkdir(targetRunDir, { mode: 0o700 })
   await mkdir(path.join(targetRunDir, 'workers'), { mode: 0o700 })
+  const configuredSettings = await readOrchestratorSettings(dataDir, { env })
+  const effectiveSolEffort = solEffort === undefined
+    ? configuredSettings.solEffort
+    : normalizeSolEffort(solEffort)
   const manifest = {
     schemaVersion: 2,
     runId: normalizedRunId,
@@ -267,6 +277,8 @@ async function createRunUnlocked({ cwd, objective, runId, dataDir }) {
     cwd: resolvedCwd,
     controller: {
       ...CONTROLLER_CONTRACT,
+      effort: effectiveSolEffort,
+      effortSource: solEffort === undefined ? configuredSettings.source : 'run-override',
     },
     workerBackend: WORKER_BACKEND,
     createdAt: new Date().toISOString(),
@@ -573,7 +585,7 @@ async function materializeWorkerUnlocked({
   if (await optionalStat(targetWorkerDir)) {
     throw new Error(`Worker already exists: ${normalizedWorkerId}`)
   }
-  const role = resolveManagedAgentRole(roleName)
+  const role = resolveManagedAgentRole(roleName, { solEffort: run.controller.effort })
   if (!role) {
     throw new Error(`Unknown role ${roleName}. Choose one of: ${MANAGED_AGENT_TYPES.join(', ')}`)
   }
@@ -698,7 +710,7 @@ function workerPrompt({ run, record, role, task }) {
     : `Private handoff path: keep the repository read-only. The controller captures your final five-field response at ${record.reportPath}; use that durable report for evidence and do not attempt to write ${record.scratchPath}.`
   return [
     'You are a bounded worker launched by the GPT-5.6 Orchestrator controller.',
-    'The main interactive session owns planning, task assignment, every consequential decision, and final acceptance; it must disclose if the required GPT-5.6 Sol max chair cannot be verified.',
+    `The main interactive session owns planning, task assignment, every consequential decision, and final acceptance; its configured Sol reasoning target for this run is ${run.controller.effort}.`,
     `Run objective: ${run.objective}`,
     `Worker role: ${record.role}`,
     `Requested launch contract: ${role.model}, reasoning effort ${role.effort}, service tier fast, sandbox ${role.sandbox}, hard timeout ${record.executionTimeoutSeconds} seconds.`,
@@ -772,7 +784,7 @@ export async function runWorker({ runId, workerId, dataDir = defaultDataDir(), e
   await assertContainedPath(runsDir(dataDir), record.taskPath, { type: 'file' })
   await assertContainedPath(runsDir(dataDir), record.scratchPath, { type: 'directory' })
   if (record.status !== 'queued') throw new Error(`Worker is not queued: ${workerId}`)
-  const role = resolveManagedAgentRole(record.role)
+  const role = resolveManagedAgentRole(record.role, { solEffort: run.controller.effort })
   if (
     !role
     || role.model !== record.model
@@ -1495,7 +1507,7 @@ function printHelp() {
     'GPT-5.6 Orchestrator Codex worker controller',
     '',
     'Commands:',
-    '  create --cwd <dir> --objective <text> [--run-id <id>]',
+    `  create --cwd <dir> --objective <text> [--run-id <id>] [--sol-effort <${SUPPORTED_SOL_EFFORTS.join('|')}>]`,
     '  spawn --run <id> --worker <id> --role <role> --task-file <path> [--allow-write --owns <path[,path]>] [--execution-timeout-seconds <n>]',
     '  status --run <id> [--json]',
     '  dashboard --run <id> [--watch] [--keep-open] [--interval-ms <n>]',
@@ -1503,6 +1515,7 @@ function printHelp() {
     '  wait --run <id> [--worker <id>] [--timeout-seconds <n>] [--json]',
     '  stop --run <id> [--worker <id>]',
     '  prune --older-than-hours <n> [--apply]',
+    `  config [--sol-effort <${SUPPORTED_SOL_EFFORTS.join('|')}>]`,
     '  data-dir',
     '  roles',
     '',
@@ -1519,6 +1532,8 @@ async function main() {
       cwd: options.cwd,
       objective: options.objective,
       runId: options['run-id'],
+      solEffort: options['sol-effort'],
+      env: process.env,
       dataDir,
     })
   } else if (command === 'spawn') {
@@ -1566,12 +1581,31 @@ async function main() {
       apply: options.apply === true,
       dataDir,
     })
+  } else if (command === 'config') {
+    const settings = options['sol-effort'] === undefined
+      ? await readOrchestratorSettings(dataDir)
+      : await writeOrchestratorSettings(dataDir, { solEffort: options['sol-effort'] })
+    result = {
+      ...settings,
+      defaultSolEffort: DEFAULT_SOL_EFFORT,
+      allowedSolEfforts: SUPPORTED_SOL_EFFORTS,
+      mainSession: {
+        currentChat: '/reasoning',
+        durableConfig: `model_reasoning_effort = "${settings.solEffort}"`,
+        oneOff: `codex -m gpt-5.6-sol -c 'model_reasoning_effort="${settings.solEffort}"' -c 'service_tier="fast"'`,
+        note: 'Plugin settings define the orchestration target and delegated Sol effort; Codex controls the active main-session effort.',
+      },
+    }
   } else if (command === 'data-dir') {
     result = { dataDir }
   } else if (command === '_worker') {
     result = await runWorker({ runId: options.run, workerId: options.worker, dataDir })
   } else if (command === 'roles') {
-    result = Object.fromEntries(MANAGED_AGENT_TYPES.map((name) => [name, resolveManagedAgentRole(name)]))
+    const settings = await readOrchestratorSettings(dataDir)
+    result = Object.fromEntries(MANAGED_AGENT_TYPES.map((name) => [
+      name,
+      resolveManagedAgentRole(name, { solEffort: settings.solEffort }),
+    ]))
   } else {
     printHelp()
     if (command !== 'help' && command !== '--help') process.exitCode = 1

@@ -1,9 +1,9 @@
 {
-  "name": "codex-sol-fusion",
-  "version": "0.2.0",
+  "name": "gpt-5-6-orchestrator",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "GPT-5.6 Sol Max main-session orchestration with dynamic pinned Codex subagents.",
+  "description": "GPT-5.6 Sol main-session orchestration with dynamic pinned Codex subagents and configurable Sol reasoning.",
   "scripts": {
     "check": "npm run check:syntax && npm run test:coverage && npm run test:coverage:critical",
     "check:compat": "npm run check:syntax && npm test",

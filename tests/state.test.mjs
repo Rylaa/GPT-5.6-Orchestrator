@@ -12,7 +12,7 @@ import {
 } from '../lib/state.mjs'
 
 async function makeDataDir() {
-  return mkdtemp(path.join(os.tmpdir(), 'codex-sol-fusion-state-'))
+  return mkdtemp(path.join(os.tmpdir(), 'gpt-5-6-orchestrator-state-'))
 }
 
 test('hashes session ids and writes private atomic state files', async () => {

@@ -1,7 +1,7 @@
 # GPT-5.6 Orchestrator development policy
 
-- Preserve a GPT-5.6 Sol `max` main session as planner and final authority.
-- Every delegated Luna, Terra, and Sol worker uses reasoning effort `max`; model tier follows task shape.
+- Preserve GPT-5.6 Sol in the main session at the configured reasoning target as planner and final authority.
+- Delegated Luna and Terra workers use reasoning effort `max`; delegated Sol specialists use the configured Sol effort. Model tier follows task shape.
 - Keep the runtime Codex-only. Do not add provider-specific sidecars or a separate QA, reviewer, verifier, or judge stage.
 - Keep hooks fail-open and observable. Treat them as workflow guardrails, not a security boundary.
 - Write workers require explicit ownership, one active writer per Git workspace, and successful post-run ownership evidence. Use separate Git worktrees for parallel writers.

@@ -5,7 +5,7 @@ description: Use when the user requests GPT-5.6 Orchestrator, Sol-led dynamic wo
 
 # GPT-5.6 Orchestrator
 
-Keep GPT-5.6 Sol at `max` in the main interactive session. That main Sol session is the permanent chair: it understands the request, makes the plan, chooses and controls workers, resolves every consequential decision, performs the most important reasoning, and owns final acceptance. Luna, Terra, and additional Sol processes are bounded workers, never co-equal decision makers.
+Keep GPT-5.6 Sol in the main interactive session at the configured reasoning target. That main Sol session is the permanent chair: it understands the request, makes the plan, chooses and controls workers, resolves every consequential decision, performs the most important reasoning, and owns final acceptance. Luna, Terra, and additional Sol processes are bounded workers, never co-equal decision makers.
 
 Once this installed plugin's command hooks are trusted, its `UserPromptSubmit` hook activates the workflow automatically for every main-session prompt. The exact `$gpt-5-6-orchestrator` token remains an explicit fallback when `GPT56_ORCHESTRATOR_AUTO=0`; `GPT56_ORCHESTRATOR_DISABLE=1` disables all plugin hooks. Never apply main-session activation to child-agent prompts.
 
@@ -14,10 +14,10 @@ Once this installed plugin's command hooks are trusted, its `UserPromptSubmit` h
 Start the main session with:
 
 ```sh
-codex -m gpt-5.6-sol -c 'model_reasoning_effort="max"' -c 'service_tier="fast"'
+codex -m gpt-5.6-sol -c 'model_reasoning_effort="high"' -c 'service_tier="fast"'
 ```
 
-If the active main session is not GPT-5.6 Sol at `max`, do not pretend it is the orchestrator. Explain the mismatch and give the restart command. Do not place Luna or Terra in the coordinator seat.
+If the active main session is not GPT-5.6 Sol, do not pretend it is the orchestrator. The plugin's default Sol target is `high`; use `node <plugin-root>/scripts/orchestrator.mjs config --sol-effort <level>` to persist `low`, `medium`, `high`, `xhigh`, or `max`. Hooks cannot inspect or change the active chat effort, so tell the user to use `/reasoning` if the current session may not match. Do not place Luna or Terra in the coordinator seat. Do not select `ultra`: its own automatic delegation conflicts with this workflow's explicit routing authority.
 
 The active direct collaboration schema cannot select a named profile, model, or reasoning effort, and its alternate Sol-root schema is rejected by the backend. For current exact routing, use only the bundled `scripts/orchestrator.mjs` controller. It starts independently logged background `codex exec` subagents. Do not start ad hoc nested Codex processes and do not use a generic native child for a named lane. Prefer native Codex subagents if a future active schema can prove the exact requested model and effort.
 
@@ -25,12 +25,15 @@ The main Sol session remains the scheduler. The bundled controller performs only
 
 Native Codex subagents are visible as Desktop threads, through CLI `/agent`, or in the IDE background-agent panel. They are not substitutes for these named lanes until the active tool schema proves the exact role, model, and effort pins.
 
+The optional native profiles can mirror the selected Sol effort with `node <plugin-root>/scripts/manage-agent-profiles.mjs install`; pass `--sol-effort <level>` to override it explicitly. Luna and Terra profiles remain at `max`.
+
 ## Dynamic worker control
 
 Resolve `<plugin-root>` from this installed skill's location, then use the bundled controller:
 
 ```sh
 node <plugin-root>/scripts/orchestrator.mjs create --cwd "$PWD" --objective "<bounded objective>"
+node <plugin-root>/scripts/orchestrator.mjs create --cwd "$PWD" --objective "<bounded objective>" --sol-effort <level>
 node <plugin-root>/scripts/orchestrator.mjs spawn --run <run-id> --worker <id> --role <role> --task-file <repo-local-task-file> --execution-timeout-seconds 1800
 node <plugin-root>/scripts/orchestrator.mjs status --run <run-id> --json
 node <plugin-root>/scripts/orchestrator.mjs dashboard --run <run-id> --watch --interval-ms 1000
@@ -39,6 +42,8 @@ node <plugin-root>/scripts/orchestrator.mjs wait --run <run-id> --worker <id> --
 node <plugin-root>/scripts/orchestrator.mjs stop --run <run-id> --worker <id>
 node <plugin-root>/scripts/orchestrator.mjs data-dir
 node <plugin-root>/scripts/orchestrator.mjs prune --older-than-hours 168
+node <plugin-root>/scripts/orchestrator.mjs config --sol-effort high
+node <plugin-root>/scripts/orchestrator.mjs config
 ```
 
 An installed controller derives the same plugin-managed data root that Codex passes to plugin hooks. `GPT56_ORCHESTRATOR_DATA_DIR` is the explicit standalone/test override. `dashboard` shows status, elapsed time, and bounded activity metadata for exact-pinned external workers; watched dashboards exit when all workers are terminal unless `--keep-open` is supplied. `pane` opens that dashboard in an optional right-side tmux view and works only when Codex CLI is already inside tmux; it is not a native Codex sidebar.
@@ -55,21 +60,21 @@ New workers emit proof schema v3. It separates the requested model/effort/sandbo
 | `orchestrator_luna_worker` | Luna, max | workspace-write | Exact repeatable edits and focused tests |
 | `orchestrator_terra_explorer` | Terra, max | read-only | Broad repository scans, large files, research synthesis |
 | `orchestrator_terra_worker` | Terra, max | workspace-write | Everyday implementation, integration, root-cause fixes |
-| `orchestrator_sol_specialist` | Sol, max | workspace-write | Critical, deeply coupled, novel, ambiguity-heavy implementation |
+| `orchestrator_sol_specialist` | Sol, configured (default high) | workspace-write | Critical, deeply coupled, novel, ambiguity-heavy implementation |
 
-There is no worker judge or separate QA stage. The Sol Max main session is the judge. An additional Sol process may be a bounded specialist, but it cannot take over orchestration or final acceptance.
+There is no worker judge or separate QA stage. The main Sol session is the judge. An additional Sol process may be a bounded specialist, but it cannot take over orchestration or final acceptance.
 
 ## Routing policy
 
 Classify each lane by ambiguity, breadth, repeatability, write scope, dependency, blast radius, and consequence.
 
-1. Keep orchestration, architecture, tradeoffs, conflicting evidence, security/auth/money decisions, destructive choices, irreversible risk, and final acceptance in the Sol Max main session.
+1. Keep orchestration, architecture, tradeoffs, conflicting evidence, security/auth/money decisions, destructive choices, irreversible risk, and final acceptance in the main Sol session.
 2. Give Luna only clear, repeatable work with exact inputs, outputs, file boundaries, and acceptance criteria.
 3. Give Terra broad read-heavy exploration and everyday work that needs real judgment, integration, or root-cause analysis.
 4. Give the most critical, deeply coupled, novel, or ambiguity-heavy implementation to `orchestrator_sol_specialist` after the main Sol session decides the direction.
 5. Do not silently substitute models or efforts. If a required pin is unavailable, mark that lane unverified.
 
-Every delegated role uses reasoning effort `max`. Task shape selects the model tier; lowering effort is not the cost-control mechanism.
+Delegated Luna and Terra roles use reasoning effort `max`. Delegated Sol specialists use the run's configured Sol effort. Choose the lowest Sol level that reliably handles the task: `medium` for routine work, `high` for complex implementation, `xhigh` for difficult cross-system reasoning, and `max` only for the hardest high-consequence work.
 
 Prompt length controls ledger policy, not model routing.
 
@@ -98,7 +103,7 @@ Decompose every request into task-shaped lanes before acting, even when efficien
 - Batch related evidence into bounded worker tasks and reuse one run rather than creating many runs.
 - Prefer Luna for mechanical speed, Terra for broad/context-heavy work, and additional Sol only for frontier reasoning or high-risk verification.
 - Poll with short `status` or bounded `wait` calls; keep the main session responsive.
-- Every worker runs at `max` on service tier `fast`, has lean isolated context, writes durable artifacts, and cannot spawn descendants. The fallback controller ignores unrelated user config, disables plugin discovery and the remote plugin catalog so unused plugin skills and hooks do not enter worker context, forces `GPT56_ORCHESTRATOR_DISABLE=1` as defense in depth, and passes every required model, effort, sandbox, and tier setting explicitly.
+- Every Luna and Terra worker runs at `max`; each delegated Sol specialist runs at the selected Sol effort. All use service tier `fast`, have lean isolated context, write durable artifacts, and cannot spawn descendants. The fallback controller ignores unrelated user config, disables plugin discovery and the remote plugin catalog so unused plugin skills and hooks do not enter worker context, forces `GPT56_ORCHESTRATOR_DISABLE=1` as defense in depth, and passes every required model, effort, sandbox, and tier setting explicitly.
 - The main Sol session may open new workers as the task evolves, using a lead-session plus dynamic-worker pattern.
 
 Hooks and process controls are workflow guardrails, not a security boundary. The live sandbox and permission policy remain authoritative.

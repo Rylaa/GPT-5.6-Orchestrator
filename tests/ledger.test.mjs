@@ -13,7 +13,7 @@ import {
 } from '../lib/ledger.mjs'
 
 async function makeTempDir() {
-  return mkdtemp(path.join(os.tmpdir(), 'codex-sol-fusion-ledger-'))
+  return mkdtemp(path.join(os.tmpdir(), 'gpt-5-6-orchestrator-ledger-'))
 }
 
 test('finds a ledger upward through a repository', async () => {
@@ -59,7 +59,7 @@ test('without git, an outside-home cwd cannot inherit a parent ledger', async ()
 test('without git, an inside-home cwd can find its nearest home-scoped ledger', async (t) => {
   let root
   try {
-    root = await mkdtemp(path.join(os.homedir(), '.codex-sol-fusion-ledger-'))
+    root = await mkdtemp(path.join(os.homedir(), '.gpt-5-6-orchestrator-ledger-'))
   } catch (error) {
     if (error?.code === 'EPERM' || error?.code === 'EACCES') {
       t.skip('sandbox does not permit temporary fixtures in the home directory')

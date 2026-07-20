@@ -1,7 +1,7 @@
 {
-  "name": "codex-sol-fusion",
-  "version": "0.2.0+codex.20260720135741",
-  "description": "Sol Max directs task-shaped Luna, Terra, and Sol Codex subagents at max effort.",
+  "name": "gpt-5-6-orchestrator",
+  "version": "0.3.0+codex.20260720144048",
+  "description": "GPT-5.6 Sol directs task-shaped Luna, Terra, and Sol Codex subagents with configurable Sol reasoning.",
   "author": {
     "name": "Yusuf"
   },
@@ -9,8 +9,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "GPT-5.6 Orchestrator",
-    "shortDescription": "Sol Max directs task-shaped max-effort workers.",
-    "longDescription": "Keeps GPT-5.6 Sol at max in the main session as planner, subagent controller, consequential decision maker, and final authority while dynamically routing bounded work to pinned max-effort Luna, Terra, or Sol Codex subagents.",
+    "shortDescription": "Sol directs task-shaped Codex workers.",
+    "longDescription": "Keeps GPT-5.6 Sol in the main session as planner, subagent controller, consequential decision maker, and final authority while dynamically routing bounded work to pinned Luna and Terra workers at max effort and Sol specialists at a configurable effort.",
     "developerName": "Yusuf",
     "category": "Productivity",
     "capabilities": [
@@ -19,8 +19,8 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Keep GPT-5.6 Sol at max in the main session and decompose every request into task-shaped lanes before acting.",
-      "Have main-session Sol clarify material ambiguity, decide, dynamically launch and control max-effort Luna, Terra, or Sol Codex subagents, and retain every consequential decision and final acceptance.",
+      "Keep GPT-5.6 Sol in the main session at the configured reasoning target and decompose every request into task-shaped lanes before acting.",
+      "Have main-session Sol clarify material ambiguity, decide, dynamically launch and control pinned Luna, Terra, or Sol Codex subagents, and retain every consequential decision and final acceptance.",
       "Have write workers run focused tests inside their bounded lane, then return evidence directly to main-session Sol for inspection and final acceptance."
     ]
   }

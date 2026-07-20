@@ -16,7 +16,7 @@ test('maps dynamic worker roles to exact models, efforts, and sandboxes', () => 
     orchestrator_luna_worker: ['gpt-5.6-luna', 'max', 'workspace-write'],
     orchestrator_terra_explorer: ['gpt-5.6-terra', 'max', 'read-only'],
     orchestrator_terra_worker: ['gpt-5.6-terra', 'max', 'workspace-write'],
-    orchestrator_sol_specialist: ['gpt-5.6-sol', 'max', 'workspace-write'],
+    orchestrator_sol_specialist: ['gpt-5.6-sol', 'high', 'workspace-write'],
   }
   assert.deepEqual(MANAGED_AGENT_TYPES, Object.keys(expected))
   for (const [name, [model, effort, sandbox]] of Object.entries(expected)) {
@@ -24,11 +24,19 @@ test('maps dynamic worker roles to exact models, efforts, and sandboxes', () => 
     assert.equal(role.model, model)
     assert.equal(role.effort, effort)
     assert.equal(role.sandbox, sandbox)
-    assert.match(role.instructions, /Sol Max main session/i)
+    assert.match(role.instructions, /main Sol session/i)
     assert.match(role.instructions, /do not spawn agents/i)
     assert.match(role.instructions, /return exactly five fields/i)
   }
   assert.equal(resolveManagedAgentRole('orchestrator_sol_judge'), null)
+  assert.equal(
+    resolveManagedAgentRole('orchestrator_sol_specialist', { solEffort: 'medium' }).effort,
+    'medium',
+  )
+  assert.throws(
+    () => resolveManagedAgentRole('orchestrator_sol_specialist', { solEffort: 'ultra' }),
+    /unsupported sol reasoning effort/i,
+  )
 })
 
 test('does not promote generic or attacker-controlled role names', () => {
@@ -45,6 +53,8 @@ test('does not promote generic or attacker-controlled role names', () => {
 test('allows only model-effort pairs represented by worker roles', () => {
   assert.equal(isManagedModelEffort({ model: 'gpt-5.6-luna', effort: 'max' }), true)
   assert.equal(isManagedModelEffort({ model: ' GPT-5.6-SOL ', effort: ' MAX ' }), true)
+  assert.equal(isManagedModelEffort({ model: 'gpt-5.6-sol', effort: 'medium' }), true)
+  assert.equal(isManagedModelEffort({ model: 'gpt-5.6-sol', effort: 'ultra' }), false)
   assert.equal(isManagedModelEffort({ model: 'gpt-5.6-luna', effort: 'medium' }), false)
   assert.equal(isManagedModelEffort({ model: 'gpt-5.6-sol' }), false)
   assert.equal(isManagedModelEffort(), false)
@@ -56,9 +66,9 @@ test('allows only model-effort pairs represented by worker roles', () => {
 })
 
 test('managed context describes proof expectations without claiming completion', () => {
-  const context = agentRoutingContext('orchestrator_sol_specialist')
-  assert.match(context, /expects gpt-5\.6-sol at max/i)
-  assert.match(context, /return control to the Sol Max main session/i)
+  const context = agentRoutingContext('orchestrator_sol_specialist', { solEffort: 'xhigh' })
+  assert.match(context, /expects gpt-5\.6-sol at xhigh/i)
+  assert.match(context, /return control to the main Sol session/i)
   assert.match(context, /verify a completed worker proof/i)
 })
 

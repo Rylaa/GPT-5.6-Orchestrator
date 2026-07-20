@@ -9,14 +9,12 @@ import {
   AGENT_PROFILE_FILES,
   checkAgentProfiles,
   installAgentProfiles,
-  LEGACY_AGENT_PROFILE_FILES,
   RETIRED_AGENT_PROFILE_FILES,
   removeAgentProfiles,
 } from '../scripts/manage-agent-profiles.mjs'
 
 const pluginRoot = path.resolve(import.meta.dirname, '..')
 const marker = '# Managed by gpt-5-6-orchestrator.'
-const legacyMarker = '# Managed by codex-sol-fusion.'
 
 async function makeCodexHome() {
   return mkdtemp(path.join(os.tmpdir(), 'g56o-home-'))
@@ -56,18 +54,19 @@ test('installs task-shaped Luna, Terra, and Sol worker profiles without a worker
   for (const filename of AGENT_PROFILE_FILES) {
     const profile = await readFile(path.join(codexHome, 'agents', filename), 'utf8')
     assert.ok(profile.startsWith(`${marker}\n`))
-    assert.match(profile, /Sol Max main session/i)
+    assert.match(profile, /main Sol session/i)
     assert.match(profile, /\[agents\]\nmax_depth = 1/)
     assert.match(profile, /do not spawn agents/i)
     assert.doesNotMatch(profile, /service_tier =/)
-    assert.match(profile, /model_reasoning_effort = "max"/)
     if (filename.startsWith('orchestrator-sol-')) {
       assert.match(profile, /model = "gpt-5\.6-sol"/)
-      assert.match(profile, /model_reasoning_effort = "max"/)
+      assert.match(profile, /model_reasoning_effort = "high"/)
     } else if (filename.startsWith('orchestrator-terra-')) {
       assert.match(profile, /model = "gpt-5\.6-terra"/)
+      assert.match(profile, /model_reasoning_effort = "max"/)
     } else {
       assert.match(profile, /model = "gpt-5\.6-luna"/)
+      assert.match(profile, /model_reasoning_effort = "max"/)
     }
   }
   assert.match(
@@ -75,6 +74,26 @@ test('installs task-shaped Luna, Terra, and Sol worker profiles without a worker
     /sandbox_mode = "workspace-write"/,
   )
   assert.equal((await checkAgentProfiles({ codexHome, pluginRoot })).ok, true)
+})
+
+test('renders the optional native Sol profile at the selected effort', async () => {
+  const codexHome = await makeCodexHome()
+  await installAgentProfiles({ codexHome, pluginRoot, solEffort: 'medium' })
+  const solProfile = await readFile(
+    path.join(codexHome, 'agents', 'orchestrator-sol-specialist.toml'),
+    'utf8',
+  )
+  const terraProfile = await readFile(
+    path.join(codexHome, 'agents', 'orchestrator-terra-worker.toml'),
+    'utf8',
+  )
+  assert.match(solProfile, /model_reasoning_effort = "medium"/)
+  assert.match(terraProfile, /model_reasoning_effort = "max"/)
+  assert.equal((await checkAgentProfiles({ codexHome, pluginRoot, solEffort: 'medium' })).ok, true)
+  assert.deepEqual(
+    (await checkAgentProfiles({ codexHome, pluginRoot, solEffort: 'high' })).changed,
+    ['orchestrator-sol-specialist.toml'],
+  )
 })
 
 test('removes retired managed reviewer and verifier profiles during install', async () => {
@@ -95,23 +114,6 @@ test('removes retired managed reviewer and verifier profiles during install', as
   const result = await installAgentProfiles({ codexHome, pluginRoot })
   assert.deepEqual(result.removedRetired, RETIRED_AGENT_PROFILE_FILES)
   assert.equal((await checkAgentProfiles({ codexHome, pluginRoot })).ok, true)
-})
-
-test('migrates only legacy profiles managed by the old package identity', async () => {
-  const codexHome = await makeCodexHome()
-  const agentsDir = path.join(codexHome, 'agents')
-  await mkdir(agentsDir)
-  for (const filename of LEGACY_AGENT_PROFILE_FILES) {
-    await writeFile(path.join(agentsDir, filename), `${legacyMarker}\nname = "old"\n`)
-  }
-  const unmanagedLegacy = path.join(agentsDir, 'csf-luna-worker.toml')
-  await writeFile(unmanagedLegacy, 'name = "mine"\n')
-
-  const result = await installAgentProfiles({ codexHome, pluginRoot })
-  assert.equal(result.removedLegacy.length, LEGACY_AGENT_PROFILE_FILES.length - 1)
-  assert.deepEqual(result.skippedLegacy, ['csf-luna-worker.toml'])
-  assert.equal(await readFile(unmanagedLegacy, 'utf8'), 'name = "mine"\n')
-  assert.equal(result.installed.length, AGENT_PROFILE_FILES.length)
 })
 
 test('is idempotent and refuses to overwrite an unmanaged new profile', async () => {
@@ -147,11 +149,9 @@ test('reports changed and missing profiles, then repairs managed content', async
   assert.equal((await checkAgentProfiles({ codexHome, pluginRoot })).ok, true)
 })
 
-test('removes only managed new or legacy profiles and rejects symlink targets', async () => {
+test('removes only managed profiles and rejects symlink targets', async () => {
   const codexHome = await makeCodexHome()
   await installAgentProfiles({ codexHome, pluginRoot })
-  const legacy = path.join(codexHome, 'agents', LEGACY_AGENT_PROFILE_FILES[0])
-  await writeFile(legacy, `${legacyMarker}\nname = "legacy"\n`)
   const unmanaged = path.join(codexHome, 'agents', 'unmanaged.toml')
   await writeFile(unmanaged, 'name = "unmanaged"\n')
   const outside = path.join(codexHome, 'outside.toml')
@@ -160,18 +160,21 @@ test('removes only managed new or legacy profiles and rejects symlink targets', 
   await symlink(outside, path.join(codexHome, 'agents', AGENT_PROFILE_FILES[0]))
 
   const removed = await removeAgentProfiles({ codexHome })
-  assert.equal(removed.removed.length, AGENT_PROFILE_FILES.length)
+  assert.equal(removed.removed.length, AGENT_PROFILE_FILES.length - 1)
   assert.deepEqual(removed.skipped, [AGENT_PROFILE_FILES[0]])
   assert.equal(await readFile(unmanaged, 'utf8'), 'name = "unmanaged"\n')
 })
 
 test('CLI installs, checks, removes, and rejects malformed actions', async () => {
   const codexHome = await makeCodexHome()
-  const install = await runManager(['install', '--codex-home', codexHome])
+  const install = await runManager([
+    'install', '--codex-home', codexHome, '--sol-effort', 'xhigh',
+  ])
   assert.equal(install.code, 0)
   assert.equal(JSON.parse(install.stdout).installed.length, AGENT_PROFILE_FILES.length)
+  assert.equal(JSON.parse(install.stdout).solEffort, 'xhigh')
 
-  const check = await runManager(['check'], { CODEX_HOME: codexHome })
+  const check = await runManager(['check', '--sol-effort', 'xhigh'], { CODEX_HOME: codexHome })
   assert.equal(check.code, 0)
   assert.equal(JSON.parse(check.stdout).ok, true)
 
@@ -186,6 +189,10 @@ test('CLI installs, checks, removes, and rejects malformed actions', async () =>
   const missingPath = await runManager(['check', '--codex-home'])
   assert.equal(missingPath.code, 1)
   assert.match(missingPath.stderr, /requires a path/i)
+
+  const missingEffort = await runManager(['check', '--sol-effort'])
+  assert.equal(missingEffort.code, 1)
+  assert.match(missingEffort.stderr, /requires a value/i)
 })
 
 test('check and remove reject a symlinked agents directory', async () => {

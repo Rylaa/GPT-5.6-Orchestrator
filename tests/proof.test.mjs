@@ -165,6 +165,32 @@ test('accepts schema-v3 proof and retains schema-v2 compatibility', async () => 
   assert.equal((await validate(fixture)).valid, true)
 })
 
+test('accepts a delegated Sol proof at the run-selected effort', async () => {
+  const fixture = await makeProofFixture()
+  const proof = clone(fixture.proof)
+  proof.role = 'orchestrator_sol_specialist'
+  proof.model = 'gpt-5.6-sol'
+  proof.effort = 'medium'
+  proof.sandbox = 'workspace-write'
+  proof.launchContract.model = proof.model
+  proof.launchContract.effort = proof.effort
+  proof.launchContract.sandbox = proof.sandbox
+  proof.baselinePath = path.join(fixture.workerRoot, 'workspace-baseline.json')
+  const worker = clone(fixture.worker)
+  worker.role = proof.role
+  worker.model = proof.model
+  worker.effort = proof.effort
+  worker.sandbox = proof.sandbox
+  const run = clone(fixture.run)
+  run.controller.effort = 'medium'
+  await Promise.all([
+    fixture.writeProof(proof),
+    fixture.writeWorker(worker),
+    fixture.writeRun(run),
+  ])
+  assert.equal((await validate(fixture)).valid, true)
+})
+
 test('rejects forged proof identity, placement, handoff paths, and roles', async () => {
   const identityCases = [
     ['schema', (proof) => { proof.schemaVersion = 1 }],
@@ -314,12 +340,12 @@ test('validates the report bytes, handoff contract, digest, and ownership baseli
   assert.match((await validate(baseline)).reason, /baseline path/i)
 })
 
-test('binds proof to the declared Sol-Max controller and workspace', async () => {
+test('binds proof to the declared Sol controller, selected effort, and workspace', async () => {
   const cases = [
     ['run', (run) => { run.runId = 'other-run' }],
     ['cwd', (run) => { run.cwd = path.join(path.dirname(run.cwd), 'other-repo') }],
     ['model', (run) => { run.controller.model = 'gpt-5.6-terra' }],
-    ['effort', (run) => { run.controller.effort = 'high' }],
+    ['effort', (run) => { run.controller.effort = 'ultra' }],
     ['authority', (run) => { run.controller.authority = 'worker' }],
     ['attestation', (run) => { run.controller.attestation = 'self-reported' }],
     ['backend', (run) => { run.workerBackend = 'native' }],

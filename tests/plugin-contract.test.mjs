@@ -18,10 +18,10 @@ async function read(relativePath) {
   return readFile(path.join(root, relativePath), 'utf8')
 }
 
-test('manifest exposes GPT-5.6 Orchestrator while preserving legacy install identity', async () => {
+test('manifest exposes the canonical GPT-5.6 Orchestrator identity', async () => {
   const manifest = JSON.parse(await read('.codex-plugin/plugin.json'))
-  assert.equal(manifest.name, 'codex-sol-fusion')
-  assert.match(manifest.version, /^0\.2\.0(?:\+codex\.\d{14})?$/)
+  assert.equal(manifest.name, 'gpt-5-6-orchestrator')
+  assert.match(manifest.version, /^0\.3\.0(?:\+codex\.\d{14})?$/)
   assert.equal(manifest.skills, './skills/')
   assert.equal(manifest.interface.displayName, 'GPT-5.6 Orchestrator')
   assert.deepEqual(manifest.interface.capabilities, ['Interactive', 'Read', 'Write'])
@@ -29,11 +29,11 @@ test('manifest exposes GPT-5.6 Orchestrator while preserving legacy install iden
   assert.equal(manifest.interface.defaultPrompt.length <= 3, true)
   const prompt = manifest.interface.defaultPrompt.join(' ')
   assert.doesNotMatch(prompt, /\$gpt-5-6-orchestrator/)
-  assert.match(prompt, /Sol at max in the main session/i)
+  assert.match(prompt, /Sol.*configured reasoning target/i)
   assert.match(prompt, /decompose every request/i)
   assert.match(prompt, /clarify material ambiguity/i)
   assert.match(prompt, /dynamic/i)
-  assert.doesNotMatch(prompt, /\$codex-sol-fusion/)
+  assert.doesNotMatch(prompt, /model fusion/i)
 })
 
 test('hook manifest uses PLUGIN_ROOT and points to the renamed handler', async () => {
@@ -66,7 +66,7 @@ test('skill defines a Sol-main-session dynamic workflow', async () => {
   const skill = await read(skillPath)
   const metadata = await read(metadataPath)
   assert.match(skill, /^---\nname: gpt-5-6-orchestrator\n/)
-  assert.match(skill, /Sol at .*max.* in the main interactive session/i)
+  assert.match(skill, /Sol in the main interactive session at the configured reasoning target/i)
   assert.match(skill, /permanent chair/i)
   assert.match(skill, /bundled .*scripts\/orchestrator\.mjs.* controller/i)
   assert.match(skill, /background `codex exec` subagents/i)
@@ -77,7 +77,7 @@ test('skill defines a Sol-main-session dynamic workflow', async () => {
   assert.match(skill, /exact-pinned external workers/i)
   assert.match(skill, /native Codex subagents.*Desktop threads.*CLI `\/agent`.*IDE background-agent panel/is)
   assert.match(skill, /There is no worker judge/i)
-  assert.match(skill, /Sol Max main session is the judge/i)
+  assert.match(skill, /main Sol session is the judge/i)
   assert.match(skill, /lead-session plus dynamic-worker pattern/i)
   assert.match(skill, /activates the workflow automatically for every main-session prompt/i)
   assert.match(skill, /Clarification gate/i)
@@ -112,7 +112,7 @@ test('worker profiles match task-shaped pins and return authority to main Sol', 
   ])))
   for (const [filename, profile] of Object.entries(contents)) {
     assert.match(profile, /^# Managed by gpt-5-6-orchestrator\./)
-    assert.match(profile, /Sol Max main session/i)
+    assert.match(profile, /main Sol session/i)
     assert.match(profile, /ledger items addressed/i)
     assert.match(profile, /evidence and files/i)
     assert.match(profile, /verification result/i)
@@ -122,14 +122,12 @@ test('worker profiles match task-shaped pins and return authority to main Sol', 
     assert.match(profile, /nickname_candidates\s*=\s*\[/)
     assert.match(profile, /\[agents\]\nmax_depth = 1/)
     assert.doesNotMatch(profile, /service_tier =/)
-    assert.match(profile, /model_reasoning_effort = "max"/)
     if (filename.startsWith('orchestrator-sol-')) {
       assert.match(profile, /model = "gpt-5\.6-sol"/)
+      assert.match(profile, /model_reasoning_effort = "high"/)
+    } else {
       assert.match(profile, /model_reasoning_effort = "max"/)
     }
-  }
-  for (const profile of Object.values(contents)) {
-    assert.match(profile, /model_reasoning_effort = "max"/)
   }
   assert.match(contents['orchestrator-sol-specialist.toml'], /sandbox_mode = "workspace-write"/)
   const nicknames = profiles.flatMap((filename) => {
@@ -149,8 +147,8 @@ test('worker profiles match task-shaped pins and return authority to main Sol', 
 test('README is concise and shows Sol controlling dynamic Codex subagents', async () => {
   const readme = await read('README.md')
   assert.equal(/^[\x09\x0a\x0d\x20-\x7e]*$/.test(readme), true)
-  assert.equal(readme.split('\n').length <= 145, true)
-  assert.match(readme, /SOL MAX \/ MAIN SESSION/)
+  assert.equal(readme.split('\n').length <= 175, true)
+  assert.match(readme, /SOL \/ MAIN SESSION/)
   assert.match(readme, /DYNAMIC CODEX SUBAGENTS/)
   assert.match(readme, /This is a Codex-only Orchestrator, not a model fusion/i)
   assert.match(readme, /There is no worker judge/i)
@@ -158,6 +156,10 @@ test('README is concise and shows Sol controlling dynamic Codex subagents', asyn
   assert.match(readme, /Automatic activation applies to main-session prompts/i)
   assert.match(readme, /Codex plugin installation does not run lifecycle scripts/i)
   assert.match(readme, /codex -m gpt-5\.6-sol.*model_reasoning_effort/)
+  assert.match(readme, /config --sol-effort high/)
+  assert.match(readme, /manage-agent-profiles\.mjs install --sol-effort medium/)
+  assert.match(readme, /Use `\/reasoning` for the current chat/i)
+  assert.match(readme, /run-level.*--sol-effort.*GPT56_ORCHESTRATOR_SOL_EFFORT.*settings\.json.*high.*default/is)
   assert.match(readme, /node scripts\/orchestrator\.mjs spawn/)
   assert.match(readme, /proof\.json/)
   assert.match(readme, /dashboard --run/i)
@@ -176,7 +178,6 @@ test('README is concise and shows Sol controlling dynamic Codex subagents', asyn
   assert.match(readme, /recoverable.*trash/i)
   assert.match(readme, /native multi-agent spawning disabled.*Orchestrator hooks disabled/i)
   assert.match(readme, /at most three verify\/fix cycles/i)
-  assert.match(readme, /legacy package ID remains.*codex-sol-fusion/i)
   assert.match(readme, /Rylaa\/fable5-orchestrator/)
   assert.match(readme, /not a security boundary/i)
   assert.match(readme, /tmux is optional/i)

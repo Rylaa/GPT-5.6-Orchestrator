@@ -122,7 +122,7 @@ test('builds exact model, effort, fast-tier, sandbox, and no-descendant Codex ar
   ])
   assert.equal(args[args.indexOf('-m') + 1], 'gpt-5.6-sol')
   assert.equal(args[args.indexOf('-s') + 1], 'workspace-write')
-  assert.ok(args.includes('model_reasoning_effort="max"'))
+  assert.ok(args.includes('model_reasoning_effort="high"'))
   assert.ok(args.includes('service_tier="fast"'))
   assert.ok(args.includes('features.multi_agent=false'))
   assert.equal(args[args.indexOf('--add-dir') + 1], '/tmp/scratch')
@@ -171,7 +171,7 @@ test('creates a Sol-controlled run and materializes bounded workers safely', asy
   const taskFile = await writeTask(cwd)
   const run = await createRun({ cwd, objective: 'Review routing', runId: 'safe-run', dataDir })
   assert.deepEqual(run.controller, {
-    model: 'gpt-5.6-sol', effort: 'max', authority: 'main-session',
+    model: 'gpt-5.6-sol', effort: 'high', effortSource: 'default', authority: 'main-session',
     attestation: 'declared-main-session-contract',
   })
   assert.equal(run.workerBackend, 'codex-exec-background')
@@ -343,14 +343,35 @@ test('launches a model-pinned Codex subagent in the background and can stop it',
   assert.equal(status.workers[0].status, 'stopped')
 })
 
-test('CLI exposes roles and rejects malformed commands', async () => {
-  const roles = await runCli(['roles'])
+test('CLI configures Sol effort, exposes resolved roles, and rejects malformed commands', async () => {
+  const { dataDir } = await makeWorkspace()
+  const env = { GPT56_ORCHESTRATOR_DATA_DIR: dataDir }
+  const configured = await runCli(['config', '--sol-effort', 'medium'], env)
+  assert.equal(configured.code, 0)
+  const parsedConfig = JSON.parse(configured.stdout)
+  assert.equal(parsedConfig.solEffort, 'medium')
+  assert.deepEqual(parsedConfig.allowedSolEfforts, ['low', 'medium', 'high', 'xhigh', 'max'])
+  assert.match(parsedConfig.mainSession.currentChat, /reasoning/)
+
+  const roles = await runCli(['roles'], env)
   assert.equal(roles.code, 0)
   const parsedRoles = JSON.parse(roles.stdout)
-  assert.equal(parsedRoles.orchestrator_sol_specialist.effort, 'max')
+  assert.equal(parsedRoles.orchestrator_sol_specialist.effort, 'medium')
+  assert.equal(parsedRoles.orchestrator_terra_worker.effort, 'max')
   assert.equal(parsedRoles.orchestrator_sol_verifier, undefined)
   assert.equal(parsedRoles.orchestrator_luna_reviewer, undefined)
   assert.equal(parsedRoles.orchestrator_terra_reviewer, undefined)
+
+  const overrideRun = await runCli([
+    'create', '--cwd', path.dirname(dataDir), '--objective', 'Override Sol effort',
+    '--run-id', 'cli-effort-run', '--sol-effort', 'xhigh',
+  ], env)
+  assert.equal(overrideRun.code, 0)
+  assert.equal(JSON.parse(overrideRun.stdout).controller.effort, 'xhigh')
+
+  const unsupported = await runCli(['config', '--sol-effort', 'ultra'], env)
+  assert.equal(unsupported.code, 1)
+  assert.match(unsupported.stderr, /unsupported sol reasoning effort/i)
 
   const malformed = await runCli(['create', '--cwd'])
   assert.equal(malformed.code, 1)
@@ -488,7 +509,7 @@ test('validates the complete controller contract and detailed task contracts', a
   const run = await createRun({ cwd, objective: 'Validate contracts', runId: 'contract-run', dataDir })
   const manifestPath = path.join(dataDir, 'runs', run.runId, 'run.json')
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
-  manifest.controller.effort = 'high'
+  manifest.controller.effort = 'ultra'
   await writeFile(manifestPath, JSON.stringify(manifest))
   await assert.rejects(() => loadRun({ runId: run.runId, dataDir }), /controller contract/i)
 
