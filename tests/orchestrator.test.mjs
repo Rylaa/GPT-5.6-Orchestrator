@@ -229,6 +229,7 @@ test('creates a Sol-controlled run and materializes bounded workers safely', asy
   assert.equal(readWorker.status, 'queued')
   assert.equal(readWorker.model, 'gpt-5.6-terra')
   assert.equal(readWorker.effort, 'max')
+  assert.equal(readWorker.taskSummary, 'Inspect package.json and return bounded evidence.')
 
   await assert.rejects(() => materializeWorker({
     runId: run.runId,
@@ -630,18 +631,48 @@ test('serializes writers per workspace while preserving read-only parallelism', 
   assert.equal(reader.status, 'queued')
 })
 
-test('renders a pure dashboard and opens a right-side pane only from an attached tmux client', async () => {
+test('renders a novice-readable live agent panel and opens it only from an attached tmux client', async () => {
   const rendered = renderDashboard({
-    runId: 'dashboard-run', objective: 'Observe workers',
+    runId: 'dashboard-run', objective: 'Find why the screen shows two back buttons',
     controller: { model: 'gpt-5.6-sol', effort: 'max', authority: 'main-session' },
     workerBackend: 'codex-exec-background', complete: false, successful: false,
     counts: { running: 1 }, workers: [{
       workerId: 'worker', status: 'running', role: 'orchestrator_terra_worker',
+      model: 'gpt-5.6-terra', effort: 'max', sandbox: 'workspace-write',
+      lane: 'everyday implementation and root-cause analysis',
+      taskSummary: 'Trace the navigation layers and identify the duplicate back-button source.',
+      elapsedMs: 25_000,
+      activity: {
+        summary: 'Reviewing source-search results',
+        recent: [
+          { kind: 'search', state: 'completed', summary: 'Searched source code — Views/CommentScreen.swift' },
+          { kind: 'read', state: 'running', summary: 'Reading source files — Views/RootNavigation.swift' },
+        ],
+      },
       owns: ['lib/worker.mjs'], reportPath: '/private/report.md',
     }],
-  })
-  assert.match(rendered, /Controller: gpt-5\.6-sol max/)
-  assert.match(rendered, /worker\trunning/)
+  }, { width: 72 })
+  assert.match(rendered, /GPT-5\.6 AGENT TEAM — LIVE WORK/)
+  assert.match(rendered, /Controller:\s+Sol · max reasoning/)
+  assert.match(rendered, /\[1\/1] worker\s+·\s+RUNNING\s+·\s+25s/)
+  assert.match(rendered, /Task:\s+Trace the navigation layers/)
+  assert.match(rendered, /Now:\s+Reviewing source-search results/)
+  assert.match(rendered, /Recent work:/)
+  assert.match(rendered, /Searched source code.*CommentScreen\.swift/s)
+  assert.match(rendered, /Report:\s+Pending: report\.md/)
+  assert.doesNotMatch(rendered, /orchestrator_terra_worker|Worker\tStatus/)
+  const narrow = renderDashboard({
+    runId: 'narrow-run', objective: 'Inspect a narrow terminal safely',
+    controller: { model: 'gpt-5.6-sol', effort: 'max', authority: 'main-session' },
+    workerBackend: 'codex-exec-background', complete: false, successful: false,
+    counts: { running: 1 },
+    workers: [{
+      workerId: 'long-worker-name', status: 'running', model: 'gpt-5.6-terra', effort: 'max',
+      sandbox: 'read-only', lane: 'broad exploration', taskSummary: 'Inspect a long objective on a narrow pane.',
+      reportPath: '/private/report.md', elapsedMs: 1_000,
+    }],
+  }, { width: 32 })
+  assert.equal(narrow.split('\n').every((line) => [...line].length <= 32), true)
   assert.match(buildPaneDashboardCommand({ runId: 'dashboard-run', intervalMs: 25 }), /'dashboard-run'/)
   await assert.rejects(() => openTmuxPane({ runId: 'dashboard-run', env: {} }), /existing tmux client/i)
 
@@ -665,6 +696,40 @@ test('renders a pure dashboard and opens a right-side pane only from an attached
   await unlink(tmux.statePath)
   const reopened = await ensureAutoTmuxPane({ runId: 'dashboard-run', dataDir: root, env })
   assert.equal(reopened.status, 'opened')
+})
+
+test('live agent panel explains queued, completed, failed, and multiple-worker states', () => {
+  const rendered = renderDashboard({
+    runId: 'multi-agent-run', objective: 'Audit and repair the flow',
+    controller: { model: 'gpt-5.6-sol', effort: 'max', authority: 'main-session' },
+    workerBackend: 'codex-exec-background', complete: false, successful: false,
+    counts: { queued: 1, completed: 1, failed: 1 },
+    workers: [
+      {
+        workerId: 'waiting-agent', status: 'queued', model: 'gpt-5.6-luna', effort: 'max',
+        sandbox: 'read-only', lane: 'focused evidence gathering', taskSummary: 'Collect the known files.',
+        reportPath: '/private/waiting/report.md',
+      },
+      {
+        workerId: 'done-agent', status: 'completed', model: 'gpt-5.6-terra', effort: 'max',
+        sandbox: 'read-only', lane: 'repository investigation', taskSummary: 'Trace the route.',
+        reportPath: '/private/done/report.md', elapsedMs: 4_000,
+      },
+      {
+        workerId: 'failed-agent', status: 'failed', model: 'gpt-5.6-sol', effort: 'max',
+        sandbox: 'workspace-write', lane: 'critical implementation', taskSummary: 'Repair the route.',
+        reportPath: '/private/failed/report.md', elapsedMs: 7_000,
+      },
+    ],
+  }, { width: 64 })
+  assert.match(rendered, /\[1\/3] waiting-agent\s+·\s+WAITING/)
+  assert.match(rendered, /Waiting for an execution slot/)
+  assert.match(rendered, /\[2\/3] done-agent\s+·\s+DONE/)
+  assert.match(rendered, /Task completed; the handoff report is ready/)
+  assert.match(rendered, /Ready: report\.md/)
+  assert.match(rendered, /\[3\/3] failed-agent\s+·\s+FAILED/)
+  assert.match(rendered, /main Sol will inspect the failure\s+evidence/)
+  assert.match(rendered, /Not accepted: report\.md/)
 })
 
 test('automatically opens one tmux dashboard on first worker launch and reuses it', async () => {

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  extractTaskObjective,
   parseKnownSections,
   referencedLedgerIds,
   validateHandoffReport,
@@ -36,6 +37,13 @@ test('parses ordinary colon-bearing bullets without terminating their section', 
     ledger: { ids: new Set(['F2', 'F3']) },
   })
   assert.deepEqual(result.ledgerIds, ['F2', 'F3'])
+  assert.equal(result.objective, 'Inspect the controller.')
+})
+
+test('extracts one bounded objective without swallowing later task sections', () => {
+  assert.equal(extractTaskObjective(detailedTask()), 'Inspect the controller.')
+  assert.equal(extractTaskObjective('Inspect package.json and return bounded evidence.'), 'Inspect package.json and return bounded evidence.')
+  assert.equal(extractTaskObjective('## Title\n\nPerform the bounded audit.'), 'Perform the bounded audit.')
 })
 
 test('ledger ranges never cross lines and malformed ranges fail clearly', () => {

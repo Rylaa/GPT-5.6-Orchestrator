@@ -38,6 +38,7 @@ import {
   validateWorkerProofPath,
 } from '../lib/proof.mjs'
 import {
+  extractTaskObjective,
   HANDOFF_FIELDS,
   validateHandoffReport,
   validateTaskContract as validateDetailedTaskContract,
@@ -45,6 +46,7 @@ import {
 import {
   parseRuntimeProofFile,
   readLatestActivity,
+  sanitizeActivityText,
 } from '../lib/runtime-events.mjs'
 import {
   DEFAULT_SOL_EFFORT,
@@ -655,6 +657,7 @@ async function materializeWorkerUnlocked({
       processToken: randomUUID(),
       ledgerPath: ledger?.path ?? null,
       ledgerIds: taskContract.ledgerIds,
+      taskSummary: taskContract.objective,
       status: 'queued',
       sourceTaskPath,
       taskPath: copiedTaskPath,
@@ -1176,11 +1179,27 @@ export async function getRunStatus({ runId, dataDir = defaultDataDir() }) {
       ...publicRecord
     } = worker
     const activity = worker.eventsPath ? await readLatestActivity(worker.eventsPath) : null
+    let taskSummary = worker.taskSummary || null
+    if (!taskSummary && worker.taskPath) {
+      try {
+        const expectedTaskPath = path.join(workerDir(dataDir, runId, worker.workerId), 'task.md')
+        if (worker.taskPath === expectedTaskPath) {
+          await assertContainedPath(runsDir(dataDir), expectedTaskPath, { type: 'file' })
+          const taskInfo = await lstat(expectedTaskPath)
+          if (taskInfo.isFile() && !taskInfo.isSymbolicLink() && taskInfo.size <= MAX_TASK_BYTES) {
+            taskSummary = extractTaskObjective(await readFile(expectedTaskPath, 'utf8'))
+          }
+        }
+      } catch {
+        taskSummary = null
+      }
+    }
     const startedAtMs = Date.parse(worker.startedAt)
     const endedAtMs = Date.parse(worker.completedAt)
     return {
       ...publicRecord,
       activity,
+      taskSummary,
       elapsedMs: Number.isFinite(startedAtMs)
         ? Math.max(0, (Number.isFinite(endedAtMs) ? endedAtMs : Date.now()) - startedAtMs)
         : null,
@@ -1264,46 +1283,149 @@ export async function stopWorkers({ runId, workerId, dataDir = defaultDataDir() 
   return { runId, stopped: outcome.stopped, signaled }
 }
 
-export function renderDashboard(status) {
-  const display = (value, limit = 96) => {
-    const normalized = String(value ?? '-').replace(/[\x00-\x1f\x7f]+/g, ' ').trim() || '-'
-    return normalized.length > limit ? `${normalized.slice(0, limit - 1)}…` : normalized
+const DASHBOARD_STATUS_LABELS = Object.freeze({
+  queued: 'WAITING',
+  running: 'RUNNING',
+  completed: 'DONE',
+  failed: 'FAILED',
+  stopped: 'STOPPED',
+})
+
+const DASHBOARD_ACTIVITY_MARKERS = Object.freeze({
+  running: '›',
+  completed: '✓',
+  failed: '!',
+  info: '•',
+})
+
+function dashboardWidth(value) {
+  const width = Number(value)
+  if (!Number.isFinite(width)) return 100
+  return Math.max(32, Math.min(160, Math.floor(width)))
+}
+
+function dashboardElapsed(value) {
+  if (!Number.isFinite(value)) return '-'
+  const seconds = Math.max(0, Math.round(value / 1000))
+  const minutes = Math.floor(seconds / 60)
+  return minutes ? `${minutes}m${String(seconds % 60).padStart(2, '0')}s` : `${seconds}s`
+}
+
+function wrapDashboardText(value, width) {
+  const normalized = sanitizeActivityText(value, 600) || '-'
+  const words = normalized.split(' ')
+  const lines = []
+  let current = ''
+  for (const originalWord of words) {
+    let word = originalWord
+    while (word.length > width) {
+      if (current) {
+        lines.push(current)
+        current = ''
+      }
+      lines.push(word.slice(0, width))
+      word = word.slice(width)
+    }
+    if (!word) continue
+    if (!current) current = word
+    else if (current.length + word.length + 1 <= width) current += ` ${word}`
+    else {
+      lines.push(current)
+      current = word
+    }
   }
-  const elapsed = (value) => {
-    if (!Number.isFinite(value)) return '-'
-    const seconds = Math.max(0, Math.round(value / 1000))
-    const minutes = Math.floor(seconds / 60)
-    return minutes ? `${minutes}m${String(seconds % 60).padStart(2, '0')}s` : `${seconds}s`
+  if (current) lines.push(current)
+  return lines.length ? lines : ['-']
+}
+
+function dashboardField(label, value, width, labelWidth = 12) {
+  const prefix = `${label}:`.padEnd(labelWidth)
+  const available = Math.max(20, width - prefix.length)
+  return wrapDashboardText(value, available).map((line, index) => (
+    `${index === 0 ? prefix : ' '.repeat(prefix.length)}${line}`
+  ))
+}
+
+function dashboardModel(worker) {
+  const model = String(worker.model || '')
+  const family = model.includes('luna') ? 'Luna' : model.includes('terra') ? 'Terra' : model.includes('sol') ? 'Sol' : model
+  const access = worker.sandbox === 'read-only' ? 'read-only' : 'workspace write'
+  return `GPT-5.6 ${family} · ${worker.effort || '-'} reasoning · ${access}`
+}
+
+function currentWorkerActivity(worker) {
+  if (worker.status === 'queued') return 'Waiting for an execution slot'
+  if (worker.status === 'completed') return 'Task completed; the handoff report is ready'
+  if (worker.status === 'failed') return 'Task failed; main Sol will inspect the failure evidence'
+  if (worker.status === 'stopped') return 'Task was stopped by main Sol'
+  return worker.activity?.summary || 'Starting up and reading the assigned task'
+}
+
+function dashboardActivityLines(worker, width) {
+  const recent = Array.isArray(worker.activity?.recent) ? worker.activity.recent.slice(-5) : []
+  if (recent.length === 0) {
+    const prefix = '  · '
+    return wrapDashboardText('No tool activity recorded yet', Math.max(20, width - prefix.length))
+      .map((line, index) => `${index === 0 ? prefix : ' '.repeat(prefix.length)}${line}`)
   }
-  const counts = Object.entries(status.counts || {})
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([state, count]) => `${state}: ${count}`)
-    .join(', ') || 'none'
-  const rows = status.workers.length === 0
-    ? ['(no workers)']
-    : status.workers.map((worker) => {
-      const owns = worker.owns?.length ? worker.owns.join(',') : '-'
-      const handoff = worker.reportPath ? path.basename(worker.reportPath) : '-'
-      return [
-        display(worker.workerId, 28),
-        display(worker.status, 12),
-        display(worker.role, 34),
-        elapsed(worker.elapsedMs),
-        display(worker.activity?.summary || (worker.status === 'queued' ? 'waiting to start' : '-'), 34),
-        display(owns, 40),
-        display(handoff, 24),
-      ].join('\t')
-    })
-  return [
-    `Run: ${status.runId}`,
-    `Objective: ${display(status.objective, 120)}`,
-    `Controller: ${status.controller.model} ${status.controller.effort} (${status.controller.authority}; ${status.controller.attestation || 'legacy declaration'})`,
-    `Worker backend: ${status.workerBackend}`,
-    `Complete: ${status.complete ? 'yes' : 'no'}; successful: ${status.successful ? 'yes' : 'no'}; counts: ${counts}`,
-    '',
-    'Worker\tStatus\tRole\tElapsed\tActivity\tOwns\tReport',
-    ...rows,
-  ].join('\n')
+  const lines = []
+  for (const activity of recent) {
+    const marker = DASHBOARD_ACTIVITY_MARKERS[activity.state] || '·'
+    const prefix = `  ${marker} `
+    const available = Math.max(20, width - prefix.length)
+    const wrapped = wrapDashboardText(activity.summary, available)
+    lines.push(...wrapped.map((line, index) => `${index === 0 ? prefix : ' '.repeat(prefix.length)}${line}`))
+  }
+  return lines
+}
+
+export function renderDashboard(status, { width = 100 } = {}) {
+  const columns = dashboardWidth(width)
+  const divider = '─'.repeat(columns)
+  const workers = Array.isArray(status.workers) ? status.workers : []
+  const counts = ['running', 'queued', 'completed', 'failed', 'stopped']
+    .filter((state) => Number(status.counts?.[state]) > 0)
+    .map((state) => `${status.counts[state]} ${state}`)
+    .join(' · ') || 'no agents yet'
+  const output = [
+    'GPT-5.6 AGENT TEAM — LIVE WORK',
+    ...dashboardField('Run', status.runId, columns),
+    ...dashboardField('Goal', status.objective, columns),
+    ...dashboardField('Progress', counts, columns),
+    ...dashboardField('Controller', `Sol · ${status.controller.effort} reasoning · main-session authority`, columns),
+  ]
+
+  if (workers.length === 0) {
+    output.push(divider, ...wrapDashboardText('No agents have been started for this run.', columns))
+  }
+
+  workers.forEach((worker, index) => {
+    const statusLabel = DASHBOARD_STATUS_LABELS[worker.status] || String(worker.status || 'UNKNOWN').toUpperCase()
+    const task = worker.taskSummary || status.objective || 'No task summary available'
+    const lane = String(worker.lane || '').replaceAll('-', ' ') || 'Bounded assigned work'
+    const reportName = worker.reportPath ? path.basename(worker.reportPath) : 'report.md'
+    const reportState = worker.status === 'completed'
+      ? `Ready: ${reportName}`
+      : worker.status === 'failed' || worker.status === 'stopped'
+        ? `Not accepted: ${reportName}`
+        : `Pending: ${reportName}`
+    const workerHeading = `[${index + 1}/${workers.length}] ${sanitizeActivityText(worker.workerId, 80) || 'agent'}  ·  ${statusLabel}  ·  ${dashboardElapsed(worker.elapsedMs)}`
+    output.push(
+      divider,
+      ...wrapDashboardText(workerHeading, columns),
+      ...dashboardField('Agent', dashboardModel(worker), columns),
+      ...dashboardField('Role', lane, columns),
+      ...dashboardField('Task', task, columns),
+      ...dashboardField('Now', currentWorkerActivity(worker), columns),
+      'Recent work:',
+      ...dashboardActivityLines(worker, columns),
+    )
+    if (worker.owns?.length) output.push(...dashboardField('Owns', worker.owns.join(', '), columns))
+    output.push(...dashboardField('Report', reportState, columns))
+  })
+
+  output.push(divider, ...wrapDashboardText('Updates automatically. The pane closes when every agent reaches a terminal state.', columns))
+  return output.join('\n')
 }
 
 function normalizeIntervalMs(value) {
@@ -1334,7 +1456,7 @@ export async function runDashboard({
   do {
     const status = await getRunStatus({ runId, dataDir })
     if (watch) write('\x1Bc')
-    write(`${renderDashboard(status)}\n`)
+    write(`${renderDashboard(status, { width: process.stdout.columns })}\n`)
     if (!watch || (status.complete && !keepOpen)) return status
     await delay(normalizedInterval)
   } while (watch)
@@ -1598,7 +1720,7 @@ function printHelp() {
     '',
     `Roles: ${MANAGED_AGENT_TYPES.join(', ')}`,
     '',
-    'Tmux: spawn automatically opens one right-side run dashboard when Codex is inside an attached client; it closes when the run is terminal.',
+    'Tmux: spawn automatically opens one right-side live-work panel with human-readable agent tasks and recent activity; it closes when the run is terminal.',
     'Set GPT56_ORCHESTRATOR_AUTO_PANE=0 to disable automatic panes; pane --run remains available for recovery.',
   ].join('\n') + '\n')
 }

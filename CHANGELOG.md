@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2 - 2026-07-21
+
+- Replace the terse tmux worker table with novice-readable live agent cards showing identity, task, current step, elapsed time, recent work, and report state.
+- Translate bounded Codex JSON events into safe activity descriptions for source search, file inspection, Git checks, tests, builds, edits, tools, and agent updates.
+- Redact credential-shaped text and never render raw commands, command output, full prompts, or hidden reasoning in the live panel.
+
 ## 0.3.1 - 2026-07-21
 
 - Automatically open one right-side run dashboard when the first worker is launched from Codex inside tmux.

@@ -94,12 +94,18 @@ high-consequence work.
 An installed controller derives the same plugin-managed data root that hooks use;
 `GPT56_ORCHESTRATOR_DATA_DIR` remains the explicit standalone/test override.
 
-Use `dashboard --run <id> --watch` for status, elapsed time, and bounded live
-activity. It exits when all workers finish; add `--keep-open` to retain it. tmux
-is optional. When Codex CLI is already inside an attached tmux client, the first
-worker `spawn` automatically opens one detached right-side dashboard for that
-run; concurrent and later spawns reuse it. The pane closes automatically when
-all workers in the run are terminal, and new activity reopens it. Set
+Use `dashboard --run <id> --watch` for a novice-readable live agent view. Each
+agent card shows its name, model, reasoning level, access, assigned task, current
+step, elapsed time, recent work, and report state. Activity is derived from a
+bounded Codex event tail and translated into safe descriptions such as searching
+source, reading files, checking Git, or running tests; the panel never prints raw
+commands, command output, full prompts, credentials, or hidden reasoning. It exits
+when all workers finish; add `--keep-open` to retain it. tmux is optional. When
+Codex CLI is already inside an attached tmux client, the first worker `spawn`
+automatically opens one detached right-side live-work panel for that run;
+concurrent and later spawns appear as additional cards in the same panel. The
+pane closes automatically when all workers in the run are terminal, and new
+activity reopens it. Set
 `GPT56_ORCHESTRATOR_AUTO_PANE=0` to opt out. `pane --run <id>`
 remains a manual recovery command. This is not a native Codex sidebar.
 
