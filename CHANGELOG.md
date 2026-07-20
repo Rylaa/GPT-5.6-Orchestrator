@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 - 2026-07-21
+
+- Automatically open one right-side run dashboard when the first worker is launched from Codex inside tmux.
+- Reuse a marked dashboard pane across concurrent and later workers, close it when the run becomes terminal, and reopen it for new activity.
+- Keep automatic pane discovery fail-open and optional through `GPT56_ORCHESTRATOR_AUTO_PANE=0`; retain `pane --run` for manual recovery.
+
 ## 0.3.0 - 2026-07-20
 
 - Rename the plugin identity and checkout from the retired project name to `gpt-5-6-orchestrator`.

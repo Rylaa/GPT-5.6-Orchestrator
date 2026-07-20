@@ -1,6 +1,6 @@
 {
   "name": "gpt-5-6-orchestrator",
-  "version": "0.3.0+codex.20260720144048",
+  "version": "0.3.1+codex.20260721002150",
   "description": "GPT-5.6 Sol directs task-shaped Luna, Terra, and Sol Codex subagents with configurable Sol reasoning.",
   "author": {
     "name": "Yusuf"

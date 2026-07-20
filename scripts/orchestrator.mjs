@@ -70,6 +70,9 @@ const DEFAULT_EXECUTION_TIMEOUT_SECONDS = 1800
 const MAX_EXECUTION_TIMEOUT_SECONDS = 86_400
 const PROCESS_HEARTBEAT_STALE_MS = 10_000
 const CONTROLLER_LOCK_STALE_MS = 30_000
+const TMUX_PANE_MARKER_OPTION = '@gpt56_orchestrator_run'
+const TMUX_PANE_TITLE = 'GPT-5.6 agents'
+const AUTO_PANE_DISABLED_VALUES = new Set(['0', 'false', 'no', 'off'])
 const CONTROLLER_CONTRACT = Object.freeze({
   model: 'gpt-5.6-sol',
   authority: 'main-session',
@@ -1098,6 +1101,7 @@ export async function launchWorker({
     executionTimeoutSeconds,
     dataDir,
   })
+  const visibility = await ensureAutoTmuxPane({ runId, dataDir, env })
   const childEnv = {
     ...env,
     GPT56_ORCHESTRATOR_DATA_DIR: dataDir,
@@ -1152,6 +1156,7 @@ export async function launchWorker({
     ...record,
     backend: WORKER_BACKEND,
     processId: child.pid,
+    visibility,
     proofRequired: path.join(workerDir(dataDir, runId, workerId), 'proof.json'),
     scratchPath: record.scratchPath,
     reportPath: record.reportPath,
@@ -1368,6 +1373,29 @@ function runChild(command, args, { env = process.env } = {}) {
   })
 }
 
+function tmuxPaneMarker({ runId, dataDir }) {
+  return createHash('sha256')
+    .update(`${path.resolve(dataDir)}\0${assertIdentifier(runId, 'run id')}`)
+    .digest('hex')
+}
+
+async function findTmuxDashboardPane({ runId, dataDir, env }) {
+  const tmuxBin = env.GPT56_ORCHESTRATOR_TMUX_BIN || 'tmux'
+  const marker = tmuxPaneMarker({ runId, dataDir })
+  const listArgs = ['list-panes']
+  if (env.TMUX_PANE) listArgs.push('-t', env.TMUX_PANE)
+  listArgs.push('-F', `#{pane_id}\t#{${TMUX_PANE_MARKER_OPTION}}`)
+  const listed = await runChild(tmuxBin, listArgs, { env })
+  if (listed.code !== 0) {
+    throw new Error(`Unable to inspect tmux dashboard panes: ${listed.stderr.trim() || 'tmux list-panes failed'}`)
+  }
+  for (const line of listed.stdout.split('\n')) {
+    const [paneId, paneMarker] = line.split('\t')
+    if (paneId && paneMarker === marker) return paneId
+  }
+  return null
+}
+
 export async function openTmuxPane({
   runId,
   width = 40,
@@ -1396,17 +1424,66 @@ export async function openTmuxPane({
     nodeBin: env.GPT56_ORCHESTRATOR_NODE_BIN || process.execPath,
     dataDir: resolvedDataDir,
   })
-  const created = await runChild(tmuxBin, [
-    'split-window', '-h', '-d', '-p', String(normalizedWidth),
+  const splitArgs = ['split-window']
+  if (env.TMUX_PANE) splitArgs.push('-t', env.TMUX_PANE)
+  splitArgs.push(
+    '-h', '-d', '-p', String(normalizedWidth),
     '-P', '-F', '#{pane_id}', command,
-  ], { env })
+  )
+  const created = await runChild(tmuxBin, splitArgs, { env })
   if (created.code !== 0) throw new Error(`Unable to open tmux dashboard pane: ${created.stderr.trim() || 'tmux split failed'}`)
   const paneId = created.stdout.trim() || null
   if (paneId) {
-    await runChild(tmuxBin, ['select-pane', '-t', paneId, '-T', 'GPT-5.6 agents'], { env })
+    const marker = tmuxPaneMarker({ runId: normalizedRunId, dataDir: resolvedDataDir })
+    const marked = await runChild(tmuxBin, [
+      'set-option', '-p', '-t', paneId, TMUX_PANE_MARKER_OPTION, marker,
+    ], { env })
+    if (marked.code !== 0) {
+      await runChild(tmuxBin, ['kill-pane', '-t', paneId], { env }).catch(() => {})
+      throw new Error(`Unable to mark tmux dashboard pane: ${marked.stderr.trim() || 'tmux set-option failed'}`)
+    }
+    await runChild(tmuxBin, ['select-pane', '-t', paneId, '-T', TMUX_PANE_TITLE], { env })
       .catch(() => {})
   }
   return { runId: normalizedRunId, paneId, width: normalizedWidth, intervalMs: normalizedInterval, command }
+}
+
+export async function ensureAutoTmuxPane({
+  runId,
+  width = 40,
+  intervalMs = 1000,
+  dataDir = null,
+  env = process.env,
+}) {
+  const autoPaneSetting = String(env.GPT56_ORCHESTRATOR_AUTO_PANE ?? '').trim().toLowerCase()
+  if (AUTO_PANE_DISABLED_VALUES.has(autoPaneSetting)) {
+    return { status: 'skipped', reason: 'disabled' }
+  }
+  if (!env.TMUX) return { status: 'skipped', reason: 'not-in-tmux' }
+  try {
+    const normalizedRunId = assertIdentifier(runId, 'run id')
+    const resolvedDataDir = dataDir ? path.resolve(dataDir) : defaultDataDir(env)
+    return await withControllerLock(resolvedDataDir, async () => {
+      const existingPaneId = await findTmuxDashboardPane({
+        runId: normalizedRunId,
+        dataDir: resolvedDataDir,
+        env,
+      })
+      if (existingPaneId) {
+        return { status: 'reused', runId: normalizedRunId, paneId: existingPaneId }
+      }
+      const opened = await openTmuxPane({
+        runId: normalizedRunId,
+        width,
+        intervalMs,
+        dataDir: resolvedDataDir,
+        env,
+      })
+      return { status: 'opened', ...opened }
+    })
+  } catch (error) {
+    return { status: 'failed', error: error.message }
+  }
 }
 
 export async function pruneRuns({
@@ -1520,6 +1597,9 @@ function printHelp() {
     '  roles',
     '',
     `Roles: ${MANAGED_AGENT_TYPES.join(', ')}`,
+    '',
+    'Tmux: spawn automatically opens one right-side run dashboard when Codex is inside an attached client; it closes when the run is terminal.',
+    'Set GPT56_ORCHESTRATOR_AUTO_PANE=0 to disable automatic panes; pane --run remains available for recovery.',
   ].join('\n') + '\n')
 }
 

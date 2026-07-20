@@ -69,6 +69,7 @@ node scripts/orchestrator.mjs create --cwd "$PWD" --objective "audit and fix the
 node scripts/orchestrator.mjs create --cwd "$PWD" --objective "critical migration" --sol-effort max
 node scripts/orchestrator.mjs spawn --run <run-id> --worker scan --role orchestrator_terra_explorer --task-file .workflow/tasks/scan.md --execution-timeout-seconds 1800
 node scripts/orchestrator.mjs status --run <run-id> --json
+node scripts/orchestrator.mjs pane --run <run-id>
 node scripts/orchestrator.mjs wait --run <run-id> --worker scan --timeout-seconds 30 --json
 node scripts/orchestrator.mjs stop --run <run-id> --worker scan
 node scripts/orchestrator.mjs data-dir
@@ -94,9 +95,13 @@ An installed controller derives the same plugin-managed data root that hooks use
 `GPT56_ORCHESTRATOR_DATA_DIR` remains the explicit standalone/test override.
 
 Use `dashboard --run <id> --watch` for status, elapsed time, and bounded live
-activity. It exits when all workers finish; add `--keep-open` to retain it. tmux is optional:
-`pane --run <id>` shows the same view in a right-side pane only when Codex CLI is
-already inside tmux; it is not a native Codex sidebar.
+activity. It exits when all workers finish; add `--keep-open` to retain it. tmux
+is optional. When Codex CLI is already inside an attached tmux client, the first
+worker `spawn` automatically opens one detached right-side dashboard for that
+run; concurrent and later spawns reuse it. The pane closes automatically when
+all workers in the run are terminal, and new activity reopens it. Set
+`GPT56_ORCHESTRATOR_AUTO_PANE=0` to opt out. `pane --run <id>`
+remains a manual recovery command. This is not a native Codex sidebar.
 
 Write workers require `--allow-write --owns <path[,path]>` and a Git worktree.
 Only one writer may run in a Git workspace across all runs; use separate worktrees

@@ -7,6 +7,7 @@ import {
   mkdtemp,
   readFile,
   symlink,
+  unlink,
   utimes,
   writeFile,
 } from 'node:fs/promises'
@@ -21,6 +22,7 @@ import {
   buildPaneDashboardCommand,
   createRun,
   defaultDataDir,
+  ensureAutoTmuxPane,
   getRunStatus,
   launchWorker,
   loadRun,
@@ -89,6 +91,47 @@ async function fakeCodex(root, {
   ].join('\n'))
   await chmod(executable, 0o700)
   return executable
+}
+
+async function fakeTmux(root) {
+  const executable = path.join(root, 'fake-tmux-' + randomUUID() + '.mjs')
+  const logPath = path.join(root, 'fake-tmux-' + randomUUID() + '.log')
+  const statePath = path.join(root, 'fake-tmux-' + randomUUID() + '.state')
+  await writeFile(executable, [
+    '#!/usr/bin/env node',
+    "import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'",
+    'const args = process.argv.slice(2)',
+    'appendFileSync(process.env.FAKE_TMUX_LOG, JSON.stringify(args) + "\\n")',
+    'const command = args[0]',
+    'if (command === "display-message") process.stdout.write("/dev/pts/1\\n")',
+    'else if (command === "list-panes") {',
+    '  if (process.env.FAKE_TMUX_LIST_FAILURE === "1") { process.stderr.write("list failed\\n"); process.exitCode = 1 }',
+    '  else if (existsSync(process.env.FAKE_TMUX_STATE)) process.stdout.write(readFileSync(process.env.FAKE_TMUX_STATE, "utf8"))',
+    '}',
+    'else if (command === "split-window") process.stdout.write("%42\\n")',
+    'else if (command === "set-option") {',
+    '  if (process.env.FAKE_TMUX_MARK_FAILURE === "1") { process.stderr.write("mark failed\\n"); process.exitCode = 1 }',
+    '  else writeFileSync(process.env.FAKE_TMUX_STATE, `${args[3]}\\t${args[5]}\\n`)',
+    '}',
+    'else if (command === "kill-pane") {',
+    '  if (existsSync(process.env.FAKE_TMUX_STATE)) unlinkSync(process.env.FAKE_TMUX_STATE)',
+    '}',
+    'else if (command !== "select-pane") process.exitCode = 1',
+  ].join('\n'))
+  await chmod(executable, 0o700)
+  return { executable, logPath, statePath }
+}
+
+function fakeTmuxEnv(tmux, overrides = {}) {
+  return {
+    ...process.env,
+    TMUX: 'test,1,0',
+    TMUX_PANE: '%7',
+    GPT56_ORCHESTRATOR_TMUX_BIN: tmux.executable,
+    FAKE_TMUX_LOG: tmux.logPath,
+    FAKE_TMUX_STATE: tmux.statePath,
+    ...overrides,
+  }
 }
 
 function runCli(args, env = {}) {
@@ -603,34 +646,86 @@ test('renders a pure dashboard and opens a right-side pane only from an attached
   await assert.rejects(() => openTmuxPane({ runId: 'dashboard-run', env: {} }), /existing tmux client/i)
 
   const root = await mkdtemp(path.join(os.tmpdir(), 'g56o-tmux-'))
-  const tmux = path.join(root, 'fake-tmux.mjs')
-  const tmuxLog = path.join(root, 'tmux.log')
-  await writeFile(tmux, [
-    '#!/usr/bin/env node',
-    'const fs = await import("node:fs")',
-    'fs.appendFileSync(process.env.FAKE_TMUX_LOG, JSON.stringify(process.argv.slice(2)) + "\\n")',
-    'if (process.argv[2] === "display-message") process.stdout.write("/dev/pts/1\\n")',
-    'else if (process.argv[2] === "split-window") process.stdout.write("%42\\n")',
-    'else if (process.argv[2] !== "select-pane") process.exitCode = 1',
-  ].join('\n'))
-  await chmod(tmux, 0o700)
+  const tmux = await fakeTmux(root)
+  const env = fakeTmuxEnv(tmux)
   const pane = await openTmuxPane({
-    runId: 'dashboard-run', width: 35, intervalMs: 25,
-    env: {
-      ...process.env,
-      TMUX: 'test,1,0',
-      GPT56_ORCHESTRATOR_TMUX_BIN: tmux,
-      FAKE_TMUX_LOG: tmuxLog,
-    },
+    runId: 'dashboard-run', width: 35, intervalMs: 25, dataDir: root, env,
   })
   assert.equal(pane.width, 35)
   assert.equal(pane.paneId, '%42')
   assert.match(pane.command, /'dashboard'/, 'dashboard command remains shell quoted')
-  const tmuxCalls = (await readFile(tmuxLog, 'utf8')).trim().split('\n').map(JSON.parse)
-  assert.deepEqual(tmuxCalls[1].slice(0, 8), [
-    'split-window', '-h', '-d', '-p', '35', '-P', '-F', '#{pane_id}',
+  const tmuxCalls = (await readFile(tmux.logPath, 'utf8')).trim().split('\n').map(JSON.parse)
+  assert.deepEqual(tmuxCalls[1].slice(0, 10), [
+    'split-window', '-t', '%7', '-h', '-d', '-p', '35', '-P', '-F', '#{pane_id}',
   ])
-  assert.deepEqual(tmuxCalls[2], ['select-pane', '-t', '%42', '-T', 'GPT-5.6 agents'])
+  assert.deepEqual(tmuxCalls[2].slice(0, 5), ['set-option', '-p', '-t', '%42', '@gpt56_orchestrator_run'])
+  assert.deepEqual(tmuxCalls[3], ['select-pane', '-t', '%42', '-T', 'GPT-5.6 agents'])
+  const reused = await ensureAutoTmuxPane({ runId: 'dashboard-run', dataDir: root, env })
+  assert.deepEqual(reused, { status: 'reused', runId: 'dashboard-run', paneId: '%42' })
+  await unlink(tmux.statePath)
+  const reopened = await ensureAutoTmuxPane({ runId: 'dashboard-run', dataDir: root, env })
+  assert.equal(reopened.status, 'opened')
+})
+
+test('automatically opens one tmux dashboard on first worker launch and reuses it', async () => {
+  const { cwd, dataDir } = await makeWorkspace()
+  const taskFile = await writeTask(cwd)
+  await createRun({ cwd, objective: 'Automatic tmux visibility', runId: 'auto-pane-run', dataDir })
+  const codexBin = await fakeCodex(dataDir, { delayMs: 100 })
+  const tmux = await fakeTmux(dataDir)
+  const env = fakeTmuxEnv(tmux, { GPT56_ORCHESTRATOR_CODEX_BIN: codexBin })
+
+  const launched = await Promise.all([
+    launchWorker({
+      runId: 'auto-pane-run', workerId: 'first', role: 'orchestrator_luna_gatherer',
+      taskFile, dataDir, env,
+    }),
+    launchWorker({
+      runId: 'auto-pane-run', workerId: 'second', role: 'orchestrator_terra_explorer',
+      taskFile, dataDir, env,
+    }),
+  ])
+  assert.deepEqual(launched.map(({ visibility }) => visibility.status).sort(), ['opened', 'reused'])
+  assert.equal(launched.every(({ visibility }) => visibility.paneId === '%42'), true)
+  const tmuxCalls = (await readFile(tmux.logPath, 'utf8')).trim().split('\n').map(JSON.parse)
+  assert.equal(tmuxCalls.filter(([command]) => command === 'split-window').length, 1)
+  assert.equal(tmuxCalls.filter(([command]) => command === 'list-panes').length, 2)
+  const finished = await waitForWorkers({ runId: 'auto-pane-run', timeoutSeconds: 5, dataDir })
+  assert.equal(finished.selectedSuccessful, true)
+})
+
+test('automatic tmux visibility skips cleanly and never blocks worker launch on pane failure', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'g56o-auto-pane-'))
+  assert.deepEqual(
+    await ensureAutoTmuxPane({ runId: 'skip-pane', dataDir: root, env: {} }),
+    { status: 'skipped', reason: 'not-in-tmux' },
+  )
+  assert.deepEqual(
+    await ensureAutoTmuxPane({
+      runId: 'skip-pane', dataDir: root,
+      env: { TMUX: 'test,1,0', GPT56_ORCHESTRATOR_AUTO_PANE: 'false' },
+    }),
+    { status: 'skipped', reason: 'disabled' },
+  )
+
+  const { cwd, dataDir } = await makeWorkspace()
+  const taskFile = await writeTask(cwd)
+  await createRun({ cwd, objective: 'Fail-open pane', runId: 'pane-failure-run', dataDir })
+  const codexBin = await fakeCodex(dataDir)
+  const tmux = await fakeTmux(dataDir)
+  const launched = await launchWorker({
+    runId: 'pane-failure-run', workerId: 'worker', role: 'orchestrator_luna_gatherer',
+    taskFile,
+    dataDir,
+    env: fakeTmuxEnv(tmux, {
+      GPT56_ORCHESTRATOR_CODEX_BIN: codexBin,
+      FAKE_TMUX_LIST_FAILURE: '1',
+    }),
+  })
+  assert.equal(launched.visibility.status, 'failed')
+  assert.match(launched.visibility.error, /unable to inspect tmux dashboard panes/i)
+  const finished = await waitForWorkers({ runId: 'pane-failure-run', timeoutSeconds: 5, dataDir })
+  assert.equal(finished.selectedSuccessful, true)
 })
 
 test('enforces hard execution timeout and exact five-field reports', async () => {
