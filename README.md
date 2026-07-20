@@ -107,6 +107,9 @@ npm audit --audit-level=high
 git diff --check
 ```
 
+CI runs syntax and the complete test suite on Node 20, then enforces full and
+critical-path coverage thresholds on Node 22.
+
 Managed access values are defaults; live permission and sandbox policy remain authoritative. Hooks and process controls are workflow reminders, not a security boundary.
 
 ## License

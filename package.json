@@ -6,6 +6,7 @@
   "description": "GPT-5.6 Sol Max main-session orchestration with dynamic pinned Codex subagents.",
   "scripts": {
     "check": "npm run check:syntax && npm run test:coverage && npm run test:coverage:critical",
+    "check:compat": "npm run check:syntax && npm test",
     "check:syntax": "node scripts/check-syntax.mjs",
     "test": "node --test tests/*.test.mjs",
     "test:coverage": "node --test --experimental-test-coverage --test-coverage-include='lib/*.mjs' --test-coverage-include='hooks/*.mjs' --test-coverage-include='scripts/*.mjs' --test-coverage-exclude='tests/**' --test-coverage-lines=80 --test-coverage-functions=80 --test-coverage-branches=80 tests/*.test.mjs",
