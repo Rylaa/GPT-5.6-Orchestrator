@@ -17,11 +17,14 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 export const AGENT_PROFILE_FILES = Object.freeze([
   'orchestrator-luna-gatherer.toml',
   'orchestrator-luna-worker.toml',
-  'orchestrator-luna-reviewer.toml',
   'orchestrator-terra-explorer.toml',
   'orchestrator-terra-worker.toml',
-  'orchestrator-terra-reviewer.toml',
   'orchestrator-sol-specialist.toml',
+])
+
+export const RETIRED_AGENT_PROFILE_FILES = Object.freeze([
+  'orchestrator-luna-reviewer.toml',
+  'orchestrator-terra-reviewer.toml',
   'orchestrator-sol-verifier.toml',
 ])
 
@@ -94,7 +97,15 @@ async function writeAtomic(targetPath, content) {
 
 export async function installAgentProfiles({ codexHome, pluginRoot }) {
   const agentsDir = await resolveAgentDirectory(codexHome, { create: true })
-  const outcome = { installed: [], updated: [], unchanged: [], removedLegacy: [], skippedLegacy: [] }
+  const outcome = {
+    installed: [],
+    updated: [],
+    unchanged: [],
+    removedRetired: [],
+    skippedRetired: [],
+    removedLegacy: [],
+    skippedLegacy: [],
+  }
 
   for (const filename of AGENT_PROFILE_FILES) {
     const { sourcePath, targetPath } = profilePaths({ codexHome, pluginRoot, filename })
@@ -126,6 +137,23 @@ export async function installAgentProfiles({ codexHome, pluginRoot }) {
     outcome.updated.push(filename)
   }
 
+  for (const filename of RETIRED_AGENT_PROFILE_FILES) {
+    const targetPath = path.join(agentsDir, filename)
+    const targetInfo = await optionalStat(targetPath)
+    if (!targetInfo) continue
+    if (!targetInfo.isFile() || targetInfo.isSymbolicLink()) {
+      outcome.skippedRetired.push(filename)
+      continue
+    }
+    const current = await readFile(targetPath, 'utf8')
+    if (!current.startsWith(`${MANAGED_MARKER}\n`)) {
+      outcome.skippedRetired.push(filename)
+      continue
+    }
+    await unlink(targetPath)
+    outcome.removedRetired.push(filename)
+  }
+
   for (const filename of LEGACY_AGENT_PROFILE_FILES) {
     const targetPath = path.join(agentsDir, filename)
     const targetInfo = await optionalStat(targetPath)
@@ -150,6 +178,7 @@ export async function installAgentProfiles({ codexHome, pluginRoot }) {
 export async function checkAgentProfiles({ codexHome, pluginRoot }) {
   const missing = []
   const changed = []
+  const retired = []
   const agentsDir = await resolveAgentDirectory(codexHome)
 
   for (const filename of AGENT_PROFILE_FILES) {
@@ -171,7 +200,22 @@ export async function checkAgentProfiles({ codexHome, pluginRoot }) {
     if (await readFile(targetPath, 'utf8') !== source) changed.push(filename)
   }
 
-  return { ok: missing.length === 0 && changed.length === 0, missing, changed }
+  if (agentsDir) {
+    for (const filename of RETIRED_AGENT_PROFILE_FILES) {
+      const targetPath = path.join(agentsDir, filename)
+      const targetInfo = await optionalStat(targetPath)
+      if (!targetInfo?.isFile() || targetInfo.isSymbolicLink()) continue
+      const current = await readFile(targetPath, 'utf8')
+      if (current.startsWith(`${MANAGED_MARKER}\n`)) retired.push(filename)
+    }
+  }
+
+  return {
+    ok: missing.length === 0 && changed.length === 0 && retired.length === 0,
+    missing,
+    changed,
+    retired,
+  }
 }
 
 export async function removeAgentProfiles({ codexHome }) {
@@ -180,7 +224,11 @@ export async function removeAgentProfiles({ codexHome }) {
   const skipped = []
   if (!agentsDir) return { removed, skipped }
 
-  for (const filename of [...AGENT_PROFILE_FILES, ...LEGACY_AGENT_PROFILE_FILES]) {
+  for (const filename of [
+    ...AGENT_PROFILE_FILES,
+    ...RETIRED_AGENT_PROFILE_FILES,
+    ...LEGACY_AGENT_PROFILE_FILES,
+  ]) {
     const targetPath = path.join(agentsDir, filename)
     const targetInfo = await optionalStat(targetPath)
     if (!targetInfo) continue

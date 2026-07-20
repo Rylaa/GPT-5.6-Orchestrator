@@ -9,12 +9,9 @@ const metadataPath = 'skills/gpt-5-6-orchestrator/agents/openai.yaml'
 const profiles = [
   'orchestrator-luna-gatherer.toml',
   'orchestrator-luna-worker.toml',
-  'orchestrator-luna-reviewer.toml',
   'orchestrator-terra-explorer.toml',
   'orchestrator-terra-worker.toml',
-  'orchestrator-terra-reviewer.toml',
   'orchestrator-sol-specialist.toml',
-  'orchestrator-sol-verifier.toml',
 ]
 
 async function read(relativePath) {
@@ -36,8 +33,6 @@ test('manifest exposes GPT-5.6 Orchestrator while preserving legacy install iden
   assert.match(prompt, /decompose every request/i)
   assert.match(prompt, /clarify material ambiguity/i)
   assert.match(prompt, /dynamic/i)
-  assert.match(prompt, /Q0-Q3 risk-based QA/i)
-  assert.match(prompt, /Q1 deploy-fast release evidence/i)
   assert.doesNotMatch(prompt, /\$codex-sol-fusion/)
 })
 
@@ -55,6 +50,8 @@ test('hook manifest uses PLUGIN_ROOT and points to the renamed handler', async (
     }
   }
   assert.ok(hooks.hooks.UserPromptSubmit)
+  assert.ok(hooks.hooks.SessionStart)
+  assert.ok(hooks.hooks.PostCompact)
   assert.ok(hooks.hooks.PreToolUse)
   assert.ok(hooks.hooks.Stop)
   assert.match(hooks.hooks.PreToolUse[0].matcher, /spawn_agent/)
@@ -62,7 +59,7 @@ test('hook manifest uses PLUGIN_ROOT and points to the renamed handler', async (
   assert.match(handler, /\$gpt-5-6-orchestrator/)
   assert.match(handler, /native spawn surface cannot prove an exact named model and effort/i)
   assert.match(handler, /proof\.json/)
-  assert.match(handler, /validateClosure/)
+  assert.doesNotMatch(handler, /validateClosure|QA-Tier|deploy-fast/)
 })
 
 test('skill defines a Sol-main-session dynamic workflow', async () => {
@@ -73,22 +70,26 @@ test('skill defines a Sol-main-session dynamic workflow', async () => {
   assert.match(skill, /permanent chair/i)
   assert.match(skill, /bundled .*scripts\/orchestrator\.mjs.* controller/i)
   assert.match(skill, /background `codex exec` subagents/i)
-  assert.match(skill, /no terminal multiplexer or daemon/i)
+  assert.match(skill, /dashboard.*--run/i)
+  assert.match(skill, /pane.*--run/i)
+  assert.match(skill, /optional.*tmux/i)
+  assert.match(skill, /already inside tmux/i)
+  assert.match(skill, /exact-pinned external workers/i)
+  assert.match(skill, /native Codex subagents.*Desktop threads.*CLI `\/agent`.*IDE background-agent panel/is)
   assert.match(skill, /There is no worker judge/i)
   assert.match(skill, /Sol Max main session is the judge/i)
-  assert.match(skill, /Claude Code Dynamic Workflows/i)
-  assert.match(skill, /Risk-based QA/i)
-  assert.match(skill, /Q0.*Q1.*Q2.*Q3/is)
-  assert.match(skill, /QA-Profile: deploy-fast/)
-  assert.match(skill, /phase predeploy/)
-  assert.match(skill, /\{sha\}.*standalone argument/i)
-  assert.match(skill, /same target/i)
-  assert.match(skill, /\.workflow\/closure\.json/)
+  assert.match(skill, /lead-session plus dynamic-worker pattern/i)
   assert.match(skill, /activates the workflow automatically for every main-session prompt/i)
   assert.match(skill, /Clarification gate/i)
   assert.match(skill, /Workers never ask the user/i)
   assert.match(skill, /\.workflow\/LEDGER\.md/)
-  assert.match(skill, /collaboration\.spawn_agent.*cannot select/i)
+  assert.match(skill, /\[~\] deferred: user-approved/i)
+  assert.match(skill, /captures every worker's final response in private `report\.md`/i)
+  assert.match(skill, /write workers may also use private `scratch`/i)
+  assert.match(skill, /runtime proof establishes.*not semantic task success/i)
+  assert.match(skill, /recursion-guard configuration/i)
+  assert.match(skill, /at most three verify\/fix cycles/i)
+  assert.match(skill, /active direct collaboration schema cannot select/i)
   assert.doesNotMatch(skill, /Luna root|Luna coordinator/i)
   assert.doesNotMatch(skill, /csf_/)
   for (const role of [
@@ -96,9 +97,11 @@ test('skill defines a Sol-main-session dynamic workflow', async () => {
     'orchestrator_terra_explorer',
     'orchestrator_terra_worker',
     'orchestrator_sol_specialist',
-    'orchestrator_sol_verifier',
   ]) assert.match(skill, new RegExp(role))
-  assert.match(metadata, /default_prompt:.*\$gpt-5-6-orchestrator/)
+  assert.doesNotMatch(skill, /Codex CLI \d/)
+  assert.doesNotMatch(skill, /orchestrator_(?:luna|terra)_reviewer|orchestrator_sol_verifier/)
+  assert.doesNotMatch(skill, /Q0|Q1|Q2|Q3|deploy-fast|closure\.json/)
+  assert.doesNotMatch(metadata, /default_prompt:.*\$gpt-5-6-orchestrator/)
   assert.match(metadata, /allow_implicit_invocation:\s*true/)
 })
 
@@ -116,6 +119,7 @@ test('worker profiles match task-shaped pins and return authority to main Sol', 
     assert.match(profile, /risks and unresolved/i)
     assert.match(profile, /confidence and out-of-scope/i)
     assert.match(profile, /do not spawn agents/i)
+    assert.match(profile, /nickname_candidates\s*=\s*\[/)
     assert.match(profile, /\[agents\]\nmax_depth = 1/)
     assert.doesNotMatch(profile, /service_tier =/)
     if (filename.startsWith('orchestrator-sol-')) {
@@ -125,40 +129,56 @@ test('worker profiles match task-shaped pins and return authority to main Sol', 
   }
   assert.match(contents['orchestrator-luna-gatherer.toml'], /model_reasoning_effort = "low"/)
   assert.match(contents['orchestrator-luna-worker.toml'], /model_reasoning_effort = "medium"/)
-  assert.match(contents['orchestrator-luna-reviewer.toml'], /model_reasoning_effort = "high"/)
   assert.match(contents['orchestrator-terra-explorer.toml'], /model_reasoning_effort = "medium"/)
   assert.match(contents['orchestrator-terra-worker.toml'], /model_reasoning_effort = "high"/)
   assert.match(contents['orchestrator-sol-specialist.toml'], /sandbox_mode = "workspace-write"/)
-  assert.match(contents['orchestrator-sol-verifier.toml'], /sandbox_mode = "read-only"/)
+  const nicknames = profiles.flatMap((filename) => {
+    const match = contents[filename].match(/nickname_candidates\s*=\s*\[([^\]]+)\]/)
+    return match ? [...match[1].matchAll(/"([^"]+)"/g)].map((item) => item[1]) : []
+  })
+  assert.equal(nicknames.length, profiles.length * 3)
+  assert.equal(new Set(nicknames).size, nicknames.length)
   await assert.rejects(() => access(path.join(root, 'agents', 'orchestrator-sol-judge.toml')))
+  for (const retired of [
+    'orchestrator-luna-reviewer.toml',
+    'orchestrator-terra-reviewer.toml',
+    'orchestrator-sol-verifier.toml',
+  ]) await assert.rejects(() => access(path.join(root, 'agents', retired)))
 })
 
 test('README is concise and shows Sol controlling dynamic Codex subagents', async () => {
   const readme = await read('README.md')
   assert.equal(/^[\x09\x0a\x0d\x20-\x7e]*$/.test(readme), true)
-  assert.equal(readme.split('\n').length <= 130, true)
+  assert.equal(readme.split('\n').length <= 145, true)
   assert.match(readme, /SOL MAX \/ MAIN SESSION/)
   assert.match(readme, /DYNAMIC CODEX SUBAGENTS/)
-  assert.match(readme, /This is an Orchestrator, not a model fusion/i)
+  assert.match(readme, /This is a Codex-only Orchestrator, not a model fusion/i)
   assert.match(readme, /There is no worker judge/i)
   assert.match(readme, /\$gpt-5-6-orchestrator/)
-  assert.match(readme, /every main-session prompt automatically/i)
+  assert.match(readme, /Automatic activation applies to main-session prompts/i)
   assert.match(readme, /Codex plugin installation does not run lifecycle scripts/i)
-  assert.match(readme, /Risk-based QA/i)
-  assert.match(readme, /Q0.*inline self-check/i)
-  assert.match(readme, /Q1\s+deploy-fast/i)
-  assert.match(readme, /exact-SHA CI/i)
-  assert.match(readme, /standalone `\{sha\}`/i)
-  assert.match(readme, /closure\.json/i)
-  assert.match(readme, /private receipt/i)
   assert.match(readme, /codex -m gpt-5\.6-sol.*model_reasoning_effort/)
   assert.match(readme, /node scripts\/orchestrator\.mjs spawn/)
   assert.match(readme, /proof\.json/)
-  assert.match(readme, /Claude Code Dynamic Workflows/i)
+  assert.match(readme, /dashboard --run/i)
+  assert.match(readme, /pane --run/i)
+  assert.match(readme, /already inside tmux/i)
+  assert.match(readme, /exact-pinned external workers/i)
+  assert.match(readme, /Desktop threads.*CLI `\/agent`.*IDE background-agent panel/is)
+  assert.match(readme, /user-approved/i)
+  assert.match(readme, /private `report\.md`.*private `scratch\/`/i)
+  assert.match(readme, /runtime proof alone is not semantic success/i)
+  assert.match(readme, /--owns/)
+  assert.match(readme, /overlap.*active write worker/i)
+  assert.match(readme, /proof\.json.*schema v2/i)
+  assert.match(readme, /native multi-agent spawning disabled.*Orchestrator hooks disabled/i)
+  assert.match(readme, /at most three verify\/fix cycles/i)
   assert.match(readme, /legacy package ID remains.*codex-sol-fusion/i)
   assert.match(readme, /Rylaa\/fable5-orchestrator/)
   assert.match(readme, /not a security boundary/i)
-  assert.match(readme, /No tmux or daemon is required/i)
+  assert.match(readme, /tmux is optional/i)
+  assert.doesNotMatch(readme, /Codex CLI \d/)
+  assert.doesNotMatch(readme, /Q0|Q1|Q2|Q3|deploy-fast|closure\.json/)
   assert.doesNotMatch(readme, /LUNA \/ COORDINATE|Luna root only coordinates/i)
   assert.doesNotMatch(readme, /csf_/)
 })
@@ -170,19 +190,16 @@ test('controller requires proof, bounded writes, and no descendants', async () =
   assert.match(controller, /requires explicit --allow-write approval/i)
   assert.match(controller, /features\.multi_agent=false/)
   assert.match(controller, /GPT56_ORCHESTRATOR_DISABLE:\s*'1'/)
-  assert.match(controller, /runTestEvidence/)
-  assert.match(controller, /runReleaseEvidence/)
-  assert.match(controller, /bindPredeployCommand/)
-  assert.match(controller, /validateReleaseEvidence/)
-  assert.match(controller, /closeRun/)
-  assert.match(controller, /closure-receipt\.json/)
   assert.match(controller, /runtimeCompleted/)
+  assert.match(controller, /recursionGuard/)
   assert.match(controller, /threadId/)
   assert.match(controller, /serviceTier: 'fast'/)
-  assert.match(policy, /writer and direct tests finish|direct tests pass before reviewers start/i)
+  assert.match(policy, /write workers run focused tests|focused tests.*return evidence/i)
   assert.match(policy, /prompt length controls ledger policy, not model routing/i)
   assert.match(policy, /do not silently substitute/i)
   assert.match(policy, /disjoint file ownership/i)
+  assert.doesNotMatch(controller, /qaTier|qaProfile|runTestEvidence|runReleaseEvidence|closeRun|deploy-fast/)
+  assert.doesNotMatch(controller, /test --run|release --run|close --run/)
 })
 
 test('source attribution and policy files contain no obvious secrets', async () => {
@@ -196,9 +213,28 @@ test('source attribution and policy files contain no obvious secrets', async () 
     skillPath,
     'scripts/manage-agent-profiles.mjs',
     'scripts/orchestrator.mjs',
-    'lib/qa.mjs',
   ]
   const content = (await Promise.all(files.map(read))).join('\n')
   assert.doesNotMatch(content, /sk-[A-Za-z0-9_-]{20,}/)
   assert.doesNotMatch(content, /(?:api[_-]?key|token|password)\s*[:=]\s*["'][^"']+["']/i)
+})
+
+test('shipped runtime and documentation remain Codex-only', async () => {
+  const shippedFiles = [
+    '.codex-plugin/plugin.json',
+    'README.md',
+    'NOTICE',
+    'hooks/hooks.json',
+    'hooks/orchestrator-hook.mjs',
+    'lib/hook-handler.mjs',
+    'lib/routing.mjs',
+    'scripts/orchestrator.mjs',
+    skillPath,
+    metadataPath,
+  ]
+  const content = (await Promise.all(shippedFiles.map(read))).join('\n')
+  for (const providerName of ['Clau' + 'de', 'Anth' + 'ropic']) {
+    assert.doesNotMatch(content, new RegExp(providerName, 'i'))
+  }
+  assert.match(content, /codex exec|codexBin|Codex-only/i)
 })

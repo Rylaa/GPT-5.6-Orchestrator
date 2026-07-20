@@ -7,7 +7,6 @@ import test from 'node:test'
 import { handleHook } from '../lib/hook-handler.mjs'
 import { resolveManagedAgentRole } from '../lib/routing.mjs'
 import { readSessionState } from '../lib/state.mjs'
-import { closeRun, createRun } from '../scripts/orchestrator.mjs'
 
 const SKILL_TOKEN = '$gpt-5-6-orchestrator'
 
@@ -54,34 +53,52 @@ async function submitPrompt(fixture, {
 async function writeRunnerProof(fixture, {
   roleName = 'orchestrator_luna_gatherer',
   valid = true,
+  recursionGuard = true,
 } = {}) {
   const runId = 'proof-run'
   const workerId = 'proof-worker'
   const role = resolveManagedAgentRole(roleName)
   const target = path.join(fixture.dataDir, 'runs', runId, 'workers', workerId)
-  await mkdir(target, { recursive: true })
+  const scratchPath = path.join(target, 'scratch')
+  await mkdir(scratchPath, { recursive: true })
   await writeFile(path.join(fixture.dataDir, 'runs', runId, 'run.json'), JSON.stringify({
     schemaVersion: 1,
     runId,
     cwd: fixture.cwd,
     controller: { model: 'gpt-5.6-sol', effort: 'max', authority: 'main-session' },
+    workerBackend: 'codex-exec-background',
   }))
   const proofPath = path.join(target, 'proof.json')
+  const taskPath = path.join(target, 'task.md')
+  const reportPath = path.join(target, 'report.md')
+  const eventsPath = path.join(target, 'events.jsonl')
+  const stderrPath = path.join(target, 'stderr.log')
   await writeFile(proofPath, JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: 2,
     status: 'completed',
     runId,
     workerId,
     role: roleName,
+    backend: 'codex-exec-background',
     model: role.model,
     effort: role.effort,
     sandbox: role.sandbox,
     serviceTier: 'fast',
     threadId: valid ? 'thread-proof' : '',
     runtimeCompleted: true,
+    recursionGuard: {
+      multiAgentDisabled: recursionGuard,
+      orchestratorHooksDisabled: recursionGuard,
+    },
     exitCode: 0,
-    startedAt: '2026-07-14T00:00:00.000Z',
-    completedAt: '2026-07-14T00:00:01.000Z',
+    startedAt: '2026-01-01T00:00:00.000Z',
+    completedAt: '2026-01-01T00:00:01.000Z',
+    taskPath,
+    scratchPath,
+    reportPath,
+    resultPath: reportPath,
+    eventsPath,
+    stderrPath,
   }))
   return proofPath
 }
@@ -95,12 +112,36 @@ test('active Sol prompts establish main-session authority and exact subagent pro
   assert.match(context, /Sol at max in the main session/i)
   assert.match(context, /bundled Codex subagent controller/i)
   assert.match(context, /non-empty thread ID/i)
-  assert.match(context, /review.*after.*writer.*tests/i)
+  assert.match(context, /no separate QA stage/i)
+  assert.match(context, /write workers run focused tests/i)
   assert.match(context, /Decompose every request into task-shaped lanes/i)
   assert.match(context, /only the main Sol session asks concise clarification/i)
   assert.match(context, /Workers never ask the user/i)
-  assert.match(context, /Q0 inline, Q1 Luna review, Q2 Terra review, or Q3 Terra plus Sol/i)
-  assert.match(context, /closure\.json/i)
+})
+
+test('SessionStart and PostCompact rehydrate policy only for active main sessions', async () => {
+  const fixture = await makeFixture()
+  const session = await handleHook('session-start', basePayload(fixture.cwd, {
+    hook_event_name: 'SessionStart',
+    source: 'startup',
+  }), { env: {}, dataDir: fixture.dataDir, now: () => 1_000 })
+  assert.equal(session.hookSpecificOutput.hookEventName, 'SessionStart')
+  assert.match(session.hookSpecificOutput.additionalContext, /task-shaped lanes/i)
+
+  await submitPrompt(fixture)
+  const compact = await handleHook('post-compact', basePayload(fixture.cwd, {
+    hook_event_name: 'PostCompact',
+    turn_id: 'turn-1',
+    trigger: 'auto',
+  }), { env: { GPT56_ORCHESTRATOR_AUTO: '0' }, dataDir: fixture.dataDir, now: () => 2_000 })
+  assert.equal(compact.hookSpecificOutput.hookEventName, 'PostCompact')
+  assert.match(compact.hookSpecificOutput.additionalContext, /owned paths/i)
+
+  const child = await handleHook('session-start', basePayload(fixture.cwd, {
+    hook_event_name: 'SessionStart',
+    agent_id: 'child-1',
+  }), { env: {}, dataDir: fixture.dataDir, now: () => 2_000 })
+  assert.equal(child, null)
 })
 
 test('Terra, Luna, and unknown roots are rejected as Orchestrator chairs', async () => {
@@ -192,7 +233,7 @@ test('SubagentStart defense-in-depth distinguishes managed and unpinned roles', 
   const managed = await handleHook('subagent-start', basePayload(fixture.cwd, {
     turn_id: 'turn-1',
     agent_id: 'agent-sol',
-    agent_type: 'orchestrator_sol_verifier',
+    agent_type: 'orchestrator_sol_specialist',
   }), { env: {}, dataDir: fixture.dataDir, now: () => 2_000 })
   assert.match(managed.hookSpecificOutput.additionalContext, /expects gpt-5\.6-sol at max/i)
   assert.match(managed.hookSpecificOutput.additionalContext, /return control to the Sol Max main session/i)
@@ -251,6 +292,14 @@ test('Stop blocks unproven worker claims and accepts a cited valid proof.json', 
     last_assistant_message: 'orchestrator_luna_gatherer completed. Proof: ' + invalidProof,
   }), { env: {}, dataDir: fixture.dataDir, now: () => 2_100 })
   assert.equal(stillBlocked.decision, 'block')
+
+  const recursiveProof = await writeRunnerProof(fixture, { recursionGuard: false })
+  const recursionBlocked = await handleHook('stop', basePayload(fixture.cwd, {
+    turn_id: 'turn-1',
+    stop_hook_active: false,
+    last_assistant_message: 'orchestrator_luna_gatherer completed. Proof: ' + recursiveProof,
+  }), { env: {}, dataDir: fixture.dataDir, now: () => 2_150 })
+  assert.equal(recursionBlocked.decision, 'block')
 
   const proofPath = await writeRunnerProof(fixture)
   const proven = await handleHook('stop', basePayload(fixture.cwd, {
@@ -315,51 +364,28 @@ test('Stop recognizes Turkish claims, ignores descriptions, and avoids recursion
   assert.equal(recursive, null)
 })
 
-test('Stop allows progress but blocks completion until ledger-backed QA closure is accepted', async () => {
+test('Stop enforces open ledger items without requiring a QA closure', async () => {
   const fixture = await makeFixture()
   await submitPrompt(fixture)
   await mkdir(path.join(fixture.cwd, '.workflow'))
   const ledgerPath = path.join(fixture.cwd, '.workflow', 'LEDGER.md')
-  await writeFile(ledgerPath, 'QA-Tier: Q1\n- [ ] 1. Requirement\n')
-  const openLedger = await handleHook('stop', basePayload(fixture.cwd, {
-    turn_id: 'turn-1',
-    stop_hook_active: false,
-    last_assistant_message: 'Implementation completed.',
-  }), { env: {}, dataDir: fixture.dataDir, now: () => 2_000 })
-  assert.equal(openLedger.decision, 'block')
-  assert.match(openLedger.reason, /ledger.*1 open/i)
+  await writeFile(ledgerPath, '- [ ] 1. Requirement\n')
 
-  await writeFile(ledgerPath, 'QA-Tier: Q1\n- [x] 1. Requirement\n')
-  const missingClosure = await handleHook('stop', basePayload(fixture.cwd, {
+  const blocked = await handleHook('stop', basePayload(fixture.cwd, {
     turn_id: 'turn-1',
     stop_hook_active: false,
-    last_assistant_message: 'The plugin implementation has been completed.',
-  }), { env: {}, dataDir: fixture.dataDir, now: () => 2_100 })
-  assert.equal(missingClosure.decision, 'block')
-  assert.match(missingClosure.reason, /QA closure/i)
-
-  const progress = await handleHook('stop', basePayload(fixture.cwd, {
-    turn_id: 'turn-1',
-    stop_hook_active: false,
-    last_assistant_message: 'Tests completed, but I am still reviewing the implementation.',
-  }), { env: {}, dataDir: fixture.dataDir, now: () => 2_200 })
-  assert.equal(progress, null)
-
-  await writeFile(ledgerPath, 'QA-Tier: Q0\n- [x] 1. Requirement\n')
-  await createRun({
-    cwd: fixture.cwd,
-    objective: 'Q0 closure',
-    runId: 'hook-qa',
-    qaTier: 'q0',
-    dataDir: fixture.dataDir,
-  })
-  await closeRun({ runId: 'hook-qa', solVerdict: 'accepted', dataDir: fixture.dataDir })
-  const accepted = await handleHook('stop', basePayload(fixture.cwd, {
-    turn_id: 'turn-1',
-    stop_hook_active: false,
-    last_assistant_message: 'Done. QA closure: .workflow/closure.json',
+    last_assistant_message: 'Task completed successfully.',
   }), { env: {}, dataDir: fixture.dataDir, now: () => 2_300 })
-  assert.equal(accepted, null)
+  assert.equal(blocked.decision, 'block')
+  assert.match(blocked.reason, /1 open item/i)
+
+  await writeFile(ledgerPath, '- [x] 1. Requirement\n')
+  const allowed = await handleHook('stop', basePayload(fixture.cwd, {
+    turn_id: 'turn-1',
+    stop_hook_active: false,
+    last_assistant_message: 'Task completed successfully.',
+  }), { env: {}, dataDir: fixture.dataDir, now: () => 2_400 })
+  assert.equal(allowed, null)
 })
 
 test('hooks auto-activate, honor opt-out, and retain explicit-token fallback', async () => {

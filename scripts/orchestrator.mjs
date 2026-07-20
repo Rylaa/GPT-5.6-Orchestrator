@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
-import { execFile, spawn } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { constants } from 'node:fs'
 import {
   chmod,
-  copyFile,
   lstat,
   mkdir,
   open,
@@ -20,7 +20,6 @@ import os from 'node:os'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { promisify } from 'node:util'
 
 import {
   MANAGED_AGENT_TYPES,
@@ -28,38 +27,34 @@ import {
 } from '../lib/routing.mjs'
 import {
   findLedger,
+  ledgerItemIds,
   parseLedger,
   readLedger,
 } from '../lib/ledger.mjs'
 import {
   assertContainedPath,
-  gitHeadSha,
-  gitRemoteBranchSha,
-  isQaReviewRole,
-  normalizeQaProfile,
-  normalizeQaTier,
-  qaPolicy,
-  RELEASE_PHASES,
   readContainedBoundedJson,
-  validateClosure,
-  validateReleaseEvidence,
-  validateReleaseProofPath,
-  validateTestProofPath,
-  validateWorkerProofPath,
-  workspaceDigest,
-} from '../lib/qa.mjs'
+} from '../lib/proof.mjs'
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url)
-const execFileAsync = promisify(execFile)
 const IDENTIFIER = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/
-const SAFE_REMOTE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const TERMINAL_STATES = new Set(['completed', 'failed', 'stopped'])
 const MAX_TASK_BYTES = 128 * 1024
 const MAX_CONCURRENCY = 8
-const MAX_TEST_COMMAND_PARTS = 128
-const MAX_TEST_TIMEOUT_SECONDS = 3600
-const MAX_RELEASE_LOG_BYTES = 4 * 1024 * 1024
-const MAX_GIT_BUFFER_BYTES = 8 * 1024 * 1024
+const DETAILED_TASK_THRESHOLD = 1500
+const CONTROLLER_CONTRACT = Object.freeze({
+  model: 'gpt-5.6-sol',
+  effort: 'max',
+  authority: 'main-session',
+})
+const WORKER_BACKEND = 'codex-exec-background'
+const HANDOFF_FIELDS = Object.freeze([
+  'Ledger items addressed and scope',
+  'Evidence and files changed',
+  'Verification result',
+  'Risks and unresolved issues',
+  'Confidence and out-of-scope findings',
+])
 
 export function defaultDataDir(env = process.env) {
   return path.resolve(
@@ -73,6 +68,23 @@ function assertIdentifier(value, label) {
     throw new Error(`${label} must match ${IDENTIFIER}`)
   }
   return String(value)
+}
+
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino
+}
+
+function assertControllerContract(manifest) {
+  const controller = manifest?.controller
+  if (
+    !controller
+    || controller.model !== CONTROLLER_CONTRACT.model
+    || controller.effort !== CONTROLLER_CONTRACT.effort
+    || controller.authority !== CONTROLLER_CONTRACT.authority
+    || manifest.workerBackend !== WORKER_BACKEND
+  ) {
+    throw new Error('Invalid Orchestrator run controller contract')
+  }
 }
 
 async function optionalStat(targetPath) {
@@ -91,6 +103,16 @@ async function ensurePrivateDirectory(targetPath) {
   }
   if (!info) await mkdir(targetPath, { recursive: true, mode: 0o700 })
   await chmod(targetPath, 0o700)
+}
+
+async function openPrivateOutput(targetPath) {
+  const existing = await optionalStat(targetPath)
+  if (existing?.isSymbolicLink()) throw new Error(`Unsafe symlinked worker artifact: ${targetPath}`)
+  return open(
+    targetPath,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | (constants.O_NOFOLLOW ?? 0),
+    0o600,
+  )
 }
 
 async function writeJsonAtomic(targetPath, value) {
@@ -113,12 +135,6 @@ function timestampId() {
   return new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)
 }
 
-function requiredTimestamp(value, label) {
-  const parsed = Date.parse(value)
-  if (!Number.isFinite(parsed)) throw new Error(`${label} has an invalid timestamp`)
-  return parsed
-}
-
 function runsDir(dataDir) {
   return path.join(dataDir, 'runs')
 }
@@ -131,31 +147,7 @@ function workerDir(dataDir, runId, workerId) {
   return path.join(runDir(dataDir, runId), 'workers', assertIdentifier(workerId, 'worker id'))
 }
 
-function testsDir(dataDir, runId) {
-  return path.join(runDir(dataDir, runId), 'tests')
-}
-
-function testDir(dataDir, runId, testId) {
-  return path.join(testsDir(dataDir, runId), assertIdentifier(testId, 'test id'))
-}
-
-function releaseDir(dataDir, runId) {
-  return path.join(runDir(dataDir, runId), 'release')
-}
-
-function releasePhaseDir(dataDir, runId, phase) {
-  if (!RELEASE_PHASES.includes(String(phase || ''))) throw new Error('Invalid release phase')
-  return path.join(releaseDir(dataDir, runId), phase)
-}
-
-export async function createRun({
-  cwd,
-  objective,
-  runId,
-  qaTier,
-  qaProfile,
-  dataDir = defaultDataDir(),
-}) {
+export async function createRun({ cwd, objective, runId, dataDir = defaultDataDir() }) {
   const resolvedCwd = await realpath(path.resolve(cwd || process.cwd()))
   const cwdInfo = await lstat(resolvedCwd)
   if (!cwdInfo.isDirectory()) throw new Error(`Working directory is not a directory: ${resolvedCwd}`)
@@ -167,41 +159,21 @@ export async function createRun({
     runId || `${timestampId()}-${randomUUID().slice(0, 8)}`,
     'run id',
   )
-  const ledgerPath = await findLedger(resolvedCwd)
-  const ledger = ledgerPath ? parseLedger(await readLedger(ledgerPath)) : null
-  const normalizedQaTier = normalizeQaTier(qaTier || ledger?.qaTier || 'q1')
-  if (ledger?.qaTier && normalizedQaTier !== ledger.qaTier) {
-    throw new Error(`QA tier ${normalizedQaTier} does not match ledger tier ${ledger.qaTier}`)
-  }
-  const ledgerQaProfile = normalizeQaProfile(ledger?.qaProfile || 'standard', normalizedQaTier)
-  const normalizedQaProfile = normalizeQaProfile(
-    qaProfile || ledger?.qaProfile || 'standard',
-    normalizedQaTier,
-  )
-  if (ledger && normalizedQaProfile !== ledgerQaProfile) {
-    throw new Error(`QA profile ${normalizedQaProfile} does not match ledger profile ${ledgerQaProfile}`)
-  }
   await ensurePrivateDirectory(dataDir)
   await ensurePrivateDirectory(runsDir(dataDir))
   const targetRunDir = runDir(dataDir, normalizedRunId)
   if (await optionalStat(targetRunDir)) throw new Error(`Run already exists: ${normalizedRunId}`)
   await mkdir(targetRunDir, { mode: 0o700 })
   await mkdir(path.join(targetRunDir, 'workers'), { mode: 0o700 })
-  await mkdir(path.join(targetRunDir, 'tests'), { mode: 0o700 })
-  await mkdir(path.join(targetRunDir, 'release'), { mode: 0o700 })
   const manifest = {
     schemaVersion: 1,
     runId: normalizedRunId,
     objective: normalizedObjective,
     cwd: resolvedCwd,
-    qaTier: normalizedQaTier,
-    qaProfile: normalizedQaProfile,
     controller: {
-      model: 'gpt-5.6-sol',
-      effort: 'max',
-      authority: 'main-session',
+      ...CONTROLLER_CONTRACT,
     },
-    workerBackend: 'codex-exec-background',
+    workerBackend: WORKER_BACKEND,
     createdAt: new Date().toISOString(),
   }
   await writeJsonAtomic(path.join(targetRunDir, 'run.json'), manifest)
@@ -214,18 +186,11 @@ export async function loadRun({ runId, dataDir = defaultDataDir() }) {
     runsDir(dataDir),
     path.join(targetRunDir, 'run.json'),
   )
-  if (manifest.runId !== runId || manifest.controller?.model !== 'gpt-5.6-sol') {
+  if (manifest.runId !== runId) {
     throw new Error(`Invalid Orchestrator run manifest: ${targetRunDir}`)
   }
-  return {
-    ...manifest,
-    qaTier: normalizeQaTier(manifest.qaTier || 'q1'),
-    qaProfile: normalizeQaProfile(
-      manifest.qaProfile || 'standard',
-      normalizeQaTier(manifest.qaTier || 'q1'),
-    ),
-    runDir: targetRunDir,
-  }
+  assertControllerContract(manifest)
+  return { ...manifest, runDir: targetRunDir }
 }
 
 function withinDirectory(parent, child) {
@@ -245,9 +210,209 @@ async function copyTaskFile({ sourcePath, destinationPath, cwd }) {
   if (!withinDirectory(cwd, resolvedSource)) {
     throw new Error('Task file must be inside the run working directory')
   }
-  await copyFile(resolvedSource, destinationPath)
-  await chmod(destinationPath, 0o600)
-  return resolvedSource
+  const noFollow = constants.O_NOFOLLOW ?? 0
+  const sourceHandle = await open(sourcePath, constants.O_RDONLY | noFollow)
+  let destinationHandle
+  let copiedSuccessfully = false
+  try {
+    const descriptorInfo = await sourceHandle.stat()
+    if (
+      !descriptorInfo.isFile()
+      || !sameFileIdentity(sourceInfo, descriptorInfo)
+      || descriptorInfo.size !== sourceInfo.size
+    ) {
+      throw new Error('Task file changed while it was being opened')
+    }
+    destinationHandle = await open(
+      destinationPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow,
+      0o600,
+    )
+    const buffer = Buffer.allocUnsafe(64 * 1024)
+    let copied = 0
+    let position = 0
+    while (true) {
+      const { bytesRead } = await sourceHandle.read(buffer, 0, buffer.length, position)
+      if (bytesRead === 0) break
+      copied += bytesRead
+      if (copied > MAX_TASK_BYTES) {
+        throw new Error(`Task file must contain between 1 and ${MAX_TASK_BYTES} bytes`)
+      }
+      await destinationHandle.write(buffer, 0, bytesRead)
+      position += bytesRead
+    }
+    const finalDescriptorInfo = await sourceHandle.stat()
+    if (
+      copied === 0
+      || copied !== descriptorInfo.size
+      || !sameFileIdentity(descriptorInfo, finalDescriptorInfo)
+      || finalDescriptorInfo.size !== descriptorInfo.size
+    ) {
+      throw new Error('Task file changed while it was being copied')
+    }
+    await destinationHandle.sync()
+    copiedSuccessfully = true
+    return resolvedSource
+  } finally {
+    await sourceHandle.close()
+    await destinationHandle?.close()
+    if (!copiedSuccessfully) {
+      await unlink(destinationPath).catch((error) => {
+        if (error?.code !== 'ENOENT') throw error
+      })
+    }
+  }
+}
+
+function sectionValue(task, names) {
+  const lines = String(task).split(/\r?\n/)
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = lines[index].match(/^\s*#*\s*([^:\n]+):\s*(.*)$/)
+    if (!match || !names.includes(match[1].trim().toLowerCase())) continue
+    const values = [match[2].trim()].filter(Boolean)
+    for (let next = index + 1; next < lines.length; next += 1) {
+      if (/^\s*#*\s*[^:\n]+:\s*/.test(lines[next])) break
+      if (lines[next].trim()) values.push(lines[next].trim())
+    }
+    return values.join('\n').trim()
+  }
+  return ''
+}
+
+function hasSectionHeader(task, names) {
+  return String(task).split(/\r?\n/).some((line) => {
+    const match = line.match(/^\s*#*\s*([^:\n]+):/)
+    return match && names.includes(match[1].trim().toLowerCase())
+  })
+}
+
+function referencedLedgerIds(value) {
+  const source = String(value).toUpperCase()
+  const ids = []
+  const ranges = /\b([A-Z]*)(\d+)\s*-\s*([A-Z]*)(\d+)\b/g
+  for (const match of source.matchAll(ranges)) {
+    const leftPrefix = match[1]
+    const rightPrefix = match[3] || leftPrefix
+    const start = Number(match[2])
+    const end = Number(match[4])
+    if (leftPrefix !== rightPrefix || end < start || end - start > 100) {
+      throw new Error(`Invalid ledger item range: ${match[0]}`)
+    }
+    for (let current = start; current <= end; current += 1) {
+      ids.push(`${leftPrefix}${current}`)
+    }
+  }
+  const withoutRanges = source.replace(ranges, ' ')
+  ids.push(...(withoutRanges.match(/\b(?:[A-Z]+\d+|V|\d+)\b/g) || []))
+  return [...new Set(ids)]
+}
+
+export function validateTaskContract({ task, ledger = null }) {
+  const normalizedTask = String(task || '')
+  const headingNames = [
+    'ledger items', 'objective', 'inputs', 'allowed files', 'allowed files/systems',
+    'allowed scope', 'acceptance checks', 'return exactly',
+  ]
+  const detailed = normalizedTask.length > DETAILED_TASK_THRESHOLD
+    || hasSectionHeader(normalizedTask, headingNames)
+  if (!detailed) return { detailed: false, ledgerIds: [] }
+  if (normalizedTask.length > DETAILED_TASK_THRESHOLD && !ledger) {
+    throw new Error(`Detailed task files above ${DETAILED_TASK_THRESHOLD} characters require a ledger`)
+  }
+
+  const required = [
+    ['ledger items'],
+    ['objective'],
+    ['inputs'],
+    ['allowed files', 'allowed files/systems', 'allowed scope'],
+    ['acceptance checks'],
+  ]
+  for (const names of required) {
+    if (!sectionValue(normalizedTask, names)) {
+      throw new Error(`Detailed task contract is missing ${names[0]}`)
+    }
+  }
+  const returnContract = sectionValue(normalizedTask, ['return exactly'])
+  if (!returnContract || !HANDOFF_FIELDS.every((field) => returnContract.includes(field))) {
+    throw new Error('Detailed task contract must require the exact five-field return')
+  }
+  const ids = referencedLedgerIds(sectionValue(normalizedTask, ['ledger items']))
+  if (ids.length === 0) throw new Error('Detailed task contract must cite ledger item IDs')
+  if (ledger) {
+    const knownIds = ledgerItemIds(ledger.content)
+    const missing = ids.filter((id) => !knownIds.has(id))
+    if (missing.length) {
+      throw new Error(`Task cites ledger IDs that do not exist: ${missing.join(', ')}`)
+    }
+  }
+  return { detailed: true, ledgerIds: ids }
+}
+
+async function findRunLedger(cwd) {
+  const ledgerPath = await findLedger(cwd)
+  if (!ledgerPath) return null
+  const content = await readLedger(ledgerPath)
+  return { path: ledgerPath, content, parsed: parseLedger(content) }
+}
+
+function normalizeOwnsInput(owns) {
+  const rawPaths = Array.isArray(owns)
+    ? owns
+    : typeof owns === 'string' ? owns.split(',') : []
+  if (rawPaths.length === 0) throw new Error('Write workers require a non-empty --owns declaration')
+  const normalized = []
+  for (const rawPath of rawPaths) {
+    const value = String(rawPath || '')
+    if (!value || value.trim() !== value || value.includes('\0')) {
+      throw new Error('Owned paths must be non-empty normalized relative paths')
+    }
+    const slashPath = value.replaceAll('\\', '/')
+    if (
+      path.posix.isAbsolute(slashPath)
+      || path.win32.isAbsolute(value)
+      || slashPath === '.'
+      || slashPath.split('/').some((part) => !part || part === '.' || part === '..')
+      || /[*?\[\]{}]/.test(slashPath)
+      || path.posix.normalize(slashPath) !== slashPath
+    ) {
+      throw new Error(`Owned path is unsafe or ambiguous: ${value}`)
+    }
+    normalized.push(slashPath)
+  }
+  return [...new Set(normalized)].sort()
+}
+
+async function assertOwnsPathsSafe(cwd, owns) {
+  for (const ownedPath of owns) {
+    let current = cwd
+    for (const component of ownedPath.split('/')) {
+      current = path.join(current, component)
+      const info = await optionalStat(current)
+      if (!info) break
+      if (info.isSymbolicLink()) throw new Error(`Owned path contains a symlinked component: ${ownedPath}`)
+    }
+  }
+}
+
+function ownedPathsOverlap(left, right) {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`)
+}
+
+function assertWriteOwnershipAvailable(activeWorkers, owns) {
+  for (const worker of activeWorkers) {
+    if (worker.sandbox !== 'workspace-write') continue
+    if (!Array.isArray(worker.owns) || worker.owns.length === 0) {
+      throw new Error(`Active write worker ${worker.workerId} has no safe ownership declaration`)
+    }
+    const activeOwns = normalizeOwnsInput(worker.owns)
+    for (const activePath of activeOwns) {
+      for (const ownedPath of owns) {
+        if (ownedPathsOverlap(activePath, ownedPath)) {
+          throw new Error(`Write ownership overlaps active worker ${worker.workerId}: ${ownedPath}`)
+        }
+      }
+    }
+  }
 }
 
 async function listWorkerRecords({ runId, dataDir }) {
@@ -278,38 +443,48 @@ export async function materializeWorker({
   workerId,
   role: roleName,
   taskFile,
+  owns,
   allowWrite = false,
   dataDir = defaultDataDir(),
 }) {
   const run = await loadRun({ runId, dataDir })
   const normalizedWorkerId = assertIdentifier(workerId, 'worker id')
+  const targetWorkerDir = workerDir(dataDir, runId, normalizedWorkerId)
+  if (await optionalStat(targetWorkerDir)) {
+    throw new Error(`Worker already exists: ${normalizedWorkerId}`)
+  }
   const role = resolveManagedAgentRole(roleName)
   if (!role) {
     throw new Error(`Unknown role ${roleName}. Choose one of: ${MANAGED_AGENT_TYPES.join(', ')}`)
   }
-  if (run.qaProfile === 'deploy-fast' && isQaReviewRole(roleName)) {
-    throw new Error('deploy-fast uses release evidence and does not allow a QA reviewer worker')
-  }
   if (role.sandbox === 'workspace-write' && !allowWrite) {
     throw new Error(`${roleName} requires explicit --allow-write approval`)
   }
+  if (role.sandbox !== 'workspace-write' && owns !== undefined) {
+    throw new Error('Only write workers may declare --owns paths')
+  }
+  const normalizedOwns = role.sandbox === 'workspace-write' ? normalizeOwnsInput(owns) : []
+  if (normalizedOwns.length) await assertOwnsPathsSafe(run.cwd, normalizedOwns)
   const activeWorkers = (await listWorkerRecords({ runId, dataDir }))
     .filter((worker) => !TERMINAL_STATES.has(worker.status))
   if (activeWorkers.length >= MAX_CONCURRENCY) {
     throw new Error(`Run already has ${MAX_CONCURRENCY} active workers`)
   }
-  const targetWorkerDir = workerDir(dataDir, runId, normalizedWorkerId)
-  if (await optionalStat(targetWorkerDir)) {
-    throw new Error(`Worker already exists: ${normalizedWorkerId}`)
-  }
+  if (role.sandbox === 'workspace-write') assertWriteOwnershipAvailable(activeWorkers, normalizedOwns)
   await mkdir(targetWorkerDir, { mode: 0o700 })
+  const scratchPath = path.join(targetWorkerDir, 'scratch')
+  await mkdir(scratchPath, { mode: 0o700 })
   const copiedTaskPath = path.join(targetWorkerDir, 'task.md')
+  const reportPath = path.join(targetWorkerDir, 'report.md')
   try {
     const sourceTaskPath = await copyTaskFile({
       sourcePath: path.resolve(taskFile),
       destinationPath: copiedTaskPath,
       cwd: run.cwd,
     })
+    const task = await readFile(copiedTaskPath, 'utf8')
+    const ledger = await findRunLedger(run.cwd)
+    const taskContract = validateTaskContract({ task, ledger })
     const now = new Date().toISOString()
     const record = {
       schemaVersion: 1,
@@ -321,9 +496,15 @@ export async function materializeWorker({
       serviceTier: 'fast',
       sandbox: role.sandbox,
       lane: role.lane,
+      owns: normalizedOwns,
+      ledgerPath: ledger?.path ?? null,
+      ledgerIds: taskContract.ledgerIds,
       status: 'queued',
       sourceTaskPath,
       taskPath: copiedTaskPath,
+      scratchPath,
+      reportPath,
+      resultPath: reportPath,
       createdAt: now,
       updatedAt: now,
     }
@@ -335,8 +516,8 @@ export async function materializeWorker({
   }
 }
 
-export function buildCodexArguments({ role, cwd, outputPath }) {
-  return [
+export function buildCodexArguments({ role, cwd, outputPath, scratchPath }) {
+  const args = [
     'exec',
     '--ephemeral',
     '--ignore-user-config',
@@ -362,16 +543,24 @@ export function buildCodexArguments({ role, cwd, outputPath }) {
     outputPath,
     '-',
   ]
+  if (role.sandbox === 'workspace-write') {
+    args.splice(args.indexOf('-s'), 0, '--add-dir', scratchPath)
+  }
+  return args
 }
 
 function workerPrompt({ run, record, role, task }) {
+  const handoff = role.sandbox === 'workspace-write'
+    ? `Private handoff paths: the controller grants ${record.scratchPath} as an additional writable directory for bulky evidence and captures your final five-field response at ${record.reportPath}. Never write outside the assigned repository ownership and that scratch directory.`
+    : `Private handoff path: keep the repository read-only. The controller captures your final five-field response at ${record.reportPath}; use that durable report for evidence and do not attempt to write ${record.scratchPath}.`
   return [
-    'You are a bounded worker controlled by a GPT-5.6 Sol Max main orchestration session.',
-    'The Sol main session owns planning, task assignment, every consequential decision, and final acceptance.',
+    'You are a bounded worker launched by the GPT-5.6 Orchestrator controller.',
+    'The main interactive session owns planning, task assignment, every consequential decision, and final acceptance; it must disclose if the required GPT-5.6 Sol max chair cannot be verified.',
     `Run objective: ${run.objective}`,
     `Worker role: ${record.role}`,
     `Pinned runtime: ${role.model}, reasoning effort ${role.effort}, service tier fast, sandbox ${role.sandbox}.`,
     `Role contract: ${role.instructions}`,
+    handoff,
     '',
     'Bounded task:',
     task,
@@ -407,16 +596,33 @@ export async function runWorker({ runId, workerId, dataDir = defaultDataDir(), e
     runsDir(dataDir),
     path.join(targetWorkerDir, 'worker.json'),
   )
+  if (
+    record.runId !== runId
+    || record.workerId !== workerId
+    || record.taskPath !== path.join(targetWorkerDir, 'task.md')
+    || record.scratchPath !== path.join(targetWorkerDir, 'scratch')
+    || record.reportPath !== path.join(targetWorkerDir, 'report.md')
+    || record.resultPath !== record.reportPath
+  ) throw new Error(`Worker handoff paths do not match its identity: ${workerId}`)
+  await assertContainedPath(runsDir(dataDir), targetWorkerDir, { type: 'directory' })
+  await assertContainedPath(runsDir(dataDir), record.taskPath, { type: 'file' })
+  await assertContainedPath(runsDir(dataDir), record.scratchPath, { type: 'directory' })
   if (record.status !== 'queued') throw new Error(`Worker is not queued: ${workerId}`)
   const role = resolveManagedAgentRole(record.role)
-  if (!role || role.model !== record.model || role.effort !== record.effort) {
+  if (
+    !role
+    || role.model !== record.model
+    || role.effort !== record.effort
+    || role.sandbox !== record.sandbox
+    || record.serviceTier !== 'fast'
+  ) {
     throw new Error(`Worker role pin does not match its manifest: ${workerId}`)
   }
   const startedAt = new Date().toISOString()
   record = {
     ...record,
     status: 'running',
-    backend: 'codex-exec-background',
+    backend: WORKER_BACKEND,
     startedAt,
     updatedAt: startedAt,
     pid: process.pid,
@@ -424,22 +630,31 @@ export async function runWorker({ runId, workerId, dataDir = defaultDataDir(), e
   await writeWorkerRecord(dataDir, runId, workerId, record)
   const eventsPath = path.join(targetWorkerDir, 'events.jsonl')
   const stderrPath = path.join(targetWorkerDir, 'stderr.log')
-  const outputPath = path.join(targetWorkerDir, 'result.md')
+  const outputPath = record.reportPath
+  if (await optionalStat(outputPath)) {
+    throw new Error(`Worker report path must not already exist: ${outputPath}`)
+  }
   const task = await readFile(record.taskPath, 'utf8')
   const prompt = workerPrompt({ run, record, role, task })
-  const args = buildCodexArguments({ role, cwd: run.cwd, outputPath })
+  const args = buildCodexArguments({
+    role,
+    cwd: run.cwd,
+    outputPath,
+    scratchPath: record.scratchPath,
+  })
   const codexBin = env.GPT56_ORCHESTRATOR_CODEX_BIN || 'codex'
   let eventsHandle
   let stderrHandle
-  let workspaceDigestStarted
-  const qaReview = isQaReviewRole(record.role)
   try {
-    workspaceDigestStarted = qaReview ? await workspaceDigest(run.cwd) : null
-    eventsHandle = await open(eventsPath, 'w', 0o600)
-    stderrHandle = await open(stderrPath, 'w', 0o600)
+    eventsHandle = await openPrivateOutput(eventsPath)
+    stderrHandle = await openPrivateOutput(stderrPath)
     const workerEnv = {
       ...env,
       GPT56_ORCHESTRATOR_DISABLE: '1',
+    }
+    const recursionGuard = {
+      multiAgentDisabled: args.includes('features.multi_agent=false'),
+      orchestratorHooksDisabled: workerEnv.GPT56_ORCHESTRATOR_DISABLE === '1',
     }
     const child = spawn(codexBin, args, {
       cwd: run.cwd,
@@ -470,37 +685,37 @@ export async function runWorker({ runId, workerId, dataDir = defaultDataDir(), e
     const events = await readFile(eventsPath, 'utf8')
     const runtime = parseRuntimeProof(events)
     const resultInfo = await optionalStat(outputPath)
-    const completedWorkspaceDigest = qaReview ? await workspaceDigest(run.cwd) : null
-    const stableQaWorkspace = !qaReview || workspaceDigestStarted === completedWorkspaceDigest
     const success = outcome.code === 0
       && outcome.signal === null
       && runtime.threadId
       && runtime.completed
+      && recursionGuard.multiAgentDisabled
+      && recursionGuard.orchestratorHooksDisabled
       && resultInfo?.isFile()
       && resultInfo.size > 0
-      && (!isQaReviewRole(record.role) || stableQaWorkspace)
     const completedAt = new Date().toISOString()
     const proof = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       status: success ? 'completed' : 'failed',
       runId,
       workerId,
       role: record.role,
+      backend: WORKER_BACKEND,
       model: role.model,
       effort: role.effort,
       serviceTier: 'fast',
       sandbox: role.sandbox,
       threadId: runtime.threadId,
       runtimeCompleted: runtime.completed,
+      recursionGuard,
       exitCode: outcome.code,
       signal: outcome.signal,
       usage: runtime.usage,
-      workspaceDigestStarted,
-      workspaceDigest: completedWorkspaceDigest,
-      workspaceStable: stableQaWorkspace,
       startedAt,
       completedAt,
       taskPath: record.taskPath,
+      scratchPath: record.scratchPath,
+      reportPath: outputPath,
       resultPath: outputPath,
       eventsPath,
       stderrPath,
@@ -515,6 +730,8 @@ export async function runWorker({ runId, workerId, dataDir = defaultDataDir(), e
       updatedAt: completedAt,
       proofPath,
       resultPath: outputPath,
+      reportPath: outputPath,
+      scratchPath: record.scratchPath,
       eventsPath,
       stderrPath,
     }
@@ -547,6 +764,7 @@ export async function launchWorker({
   workerId,
   role,
   taskFile,
+  owns,
   allowWrite = false,
   dataDir = defaultDataDir(),
   env = process.env,
@@ -557,6 +775,7 @@ export async function launchWorker({
     workerId,
     role,
     taskFile,
+    owns,
     allowWrite,
     dataDir,
   })
@@ -598,9 +817,11 @@ export async function launchWorker({
   }
   return {
     ...record,
-    backend: 'codex-exec-background',
+    backend: WORKER_BACKEND,
     processId: child.pid,
     proofRequired: path.join(workerDir(dataDir, runId, workerId), 'proof.json'),
+    scratchPath: record.scratchPath,
+    reportPath: record.reportPath,
   }
 }
 
@@ -615,8 +836,6 @@ export async function getRunStatus({ runId, dataDir = defaultDataDir() }) {
     runId,
     objective: run.objective,
     cwd: run.cwd,
-    qaTier: run.qaTier,
-    qaProfile: run.qaProfile,
     controller: run.controller,
     workerBackend: run.workerBackend,
     complete: workers.length > 0 && workers.every((worker) => TERMINAL_STATES.has(worker.status)),
@@ -624,645 +843,6 @@ export async function getRunStatus({ runId, dataDir = defaultDataDir() }) {
     counts,
     workers,
   }
-}
-
-function normalizeEvidenceCommand(command, label) {
-  if (!Array.isArray(command) || command.length === 0 || command.length > MAX_TEST_COMMAND_PARTS) {
-    throw new Error(`${label} command must contain between 1 and ${MAX_TEST_COMMAND_PARTS} parts`)
-  }
-  return command.map((part) => {
-    const value = String(part)
-    if (!value || value.length > 4096 || value.includes('\0')) {
-      throw new Error(`${label} command contains an invalid part`)
-    }
-    return value
-  })
-}
-
-function normalizeTestCommand(command) {
-  return normalizeEvidenceCommand(command, 'test')
-}
-
-function normalizeReleaseTarget(target) {
-  const normalized = String(target || '').trim()
-  if (!normalized || normalized.length > 2048 || normalized.includes('\0')) {
-    throw new Error('release target must contain between 1 and 2048 safe characters')
-  }
-  return normalized
-}
-
-function bindPredeployCommand(command, gitSha) {
-  const hasPlaceholder = command.includes('{sha}')
-  if (!hasPlaceholder) {
-    throw new Error('predeploy command must include {sha} as an exact argument')
-  }
-  return command.map((part) => part === '{sha}' ? gitSha : part)
-}
-
-function normalizeRemote(remote) {
-  const normalized = String(remote || '')
-  if (!SAFE_REMOTE.test(normalized)) {
-    throw new Error('remote must be a bounded named Git remote')
-  }
-  return normalized
-}
-
-async function gitText(cwd, args) {
-  const result = await execFileAsync('git', ['-C', cwd, ...args], {
-    encoding: 'utf8',
-    maxBuffer: MAX_GIT_BUFFER_BYTES,
-    env: {
-      ...process.env,
-      GIT_ALLOW_PROTOCOL: 'file:https:http:ssh:git',
-      GIT_OPTIONAL_LOCKS: '0',
-      GIT_SSH_COMMAND: 'ssh',
-    },
-  })
-  return result.stdout
-}
-
-async function normalizeBranch(cwd, branch) {
-  const normalized = String(branch || '')
-  if (
-    !normalized
-    || normalized.length > 1024
-    || normalized.startsWith('-')
-    || normalized.includes('\0')
-  ) throw new Error('branch must be a bounded Git branch name')
-  await gitText(cwd, ['check-ref-format', '--branch', normalized])
-  return normalized
-}
-
-async function gitRepositorySnapshot(cwd) {
-  const root = (await gitText(cwd, ['rev-parse', '--show-toplevel'])).trim()
-  const gitSha = await gitHeadSha(root)
-  const status = await gitText(root, [
-    'status',
-    '--porcelain=v1',
-    '-z',
-    '--untracked-files=all',
-    '--',
-    '.',
-    ':(exclude).workflow',
-    ':(exclude).workflow/**',
-  ])
-  return {
-    root,
-    gitSha,
-    dirtyEntryCount: status.split('\0').filter(Boolean).length,
-  }
-}
-
-function requireCleanReleaseSnapshot(snapshot) {
-  if (snapshot.dirtyEntryCount > 0) {
-    throw new Error(
-      `deploy-fast requires a clean tracked source tree outside .workflow (${snapshot.dirtyEntryCount} change(s))`,
-    )
-  }
-}
-
-async function strictlyLaterIso(previousTimestamp = 0) {
-  const previous = Number(previousTimestamp) || 0
-  if (previous > Date.now() + 1000) throw new Error('Prior release evidence has a future timestamp')
-  if (Date.now() <= previous) await delay(previous - Date.now() + 1)
-  return new Date().toISOString()
-}
-
-async function runBoundedCommand({ command, cwd, env, timeoutSeconds, stdoutPath, stderrPath }) {
-  let stdoutBytes = 0
-  let stderrBytes = 0
-  let outputLimitExceeded = false
-  const stdoutChunks = []
-  const stderrChunks = []
-  let child
-  let killTimer = null
-  let timeoutTimer = null
-  let timedOut = false
-
-  const append = (chunk, chunks, currentBytes) => {
-    const buffer = Buffer.from(chunk)
-    const remaining = Math.max(0, MAX_RELEASE_LOG_BYTES - currentBytes)
-    if (remaining > 0) chunks.push(buffer.subarray(0, remaining))
-    if (buffer.length > remaining) outputLimitExceeded = true
-    return currentBytes + Math.min(buffer.length, remaining)
-  }
-  const terminate = () => {
-    if (!child || child.killed) return
-    child.kill('SIGTERM')
-    killTimer = setTimeout(() => child.kill('SIGKILL'), 1000)
-  }
-
-  const outcome = await new Promise((resolve) => {
-    let settled = false
-    child = spawn(command[0], command.slice(1), {
-      cwd,
-      env,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-    child.stdout.on('data', (chunk) => {
-      stdoutBytes = append(chunk, stdoutChunks, stdoutBytes)
-      if (outputLimitExceeded) terminate()
-    })
-    child.stderr.on('data', (chunk) => {
-      stderrBytes = append(chunk, stderrChunks, stderrBytes)
-      if (outputLimitExceeded) terminate()
-    })
-    timeoutTimer = setTimeout(() => {
-      timedOut = true
-      terminate()
-    }, timeoutSeconds * 1000)
-    child.once('error', (error) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timeoutTimer)
-      clearTimeout(killTimer)
-      resolve({ code: null, signal: null, error: error.message })
-    })
-    child.once('close', (code, signal) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timeoutTimer)
-      clearTimeout(killTimer)
-      resolve({
-        code,
-        signal,
-        error: timedOut
-          ? 'release command timed out'
-          : outputLimitExceeded ? 'release command exceeded the log limit' : null,
-      })
-    })
-  })
-  await Promise.all([
-    writeFile(stdoutPath, Buffer.concat(stdoutChunks), { mode: 0o600 }),
-    writeFile(stderrPath, Buffer.concat(stderrChunks), { mode: 0o600 }),
-  ])
-  return { ...outcome, timedOut, outputLimitExceeded }
-}
-
-function latestWriterCompletion(workers) {
-  return Math.max(0, ...workers
-    .filter((worker) => worker.sandbox === 'workspace-write' && TERMINAL_STATES.has(worker.status))
-    .map((worker) => requiredTimestamp(worker.completedAt, `worker ${worker.workerId}`)))
-}
-
-async function validateReleasePrefix({
-  phase,
-  run,
-  dataDir,
-  digest,
-  gitSha,
-  latestWriterAt,
-  target,
-}) {
-  if (phase === 'predeploy') return { completedAt: latestWriterAt }
-  const predeploy = await validateReleaseProofPath({
-    proofPath: path.join(releasePhaseDir(dataDir, run.runId, 'predeploy'), 'proof.json'),
-    phase: 'predeploy',
-    cwd: run.cwd,
-    dataDir,
-    expectedDigest: digest,
-    expectedGitSha: gitSha,
-    expectedRunId: run.runId,
-  })
-  if (!predeploy.valid) throw new Error(`Current predeploy evidence is required: ${predeploy.reason}`)
-  const currentRemoteSha = await gitRemoteBranchSha(
-    run.cwd,
-    predeploy.proof.remote,
-    predeploy.proof.branch,
-  )
-  if (currentRemoteSha !== gitSha) {
-    throw new Error('The named remote branch no longer matches the release Git SHA')
-  }
-  if (requiredTimestamp(predeploy.proof.startedAt, 'predeploy') <= latestWriterAt) {
-    throw new Error('Predeploy must start strictly after write workers finish')
-  }
-  if (phase === 'deploy') {
-    return {
-      completedAt: requiredTimestamp(predeploy.proof.completedAt, 'predeploy'),
-      remote: predeploy.proof.remote,
-      branch: predeploy.proof.branch,
-      remoteSha: currentRemoteSha,
-    }
-  }
-  const deploy = await validateReleaseProofPath({
-    proofPath: path.join(releasePhaseDir(dataDir, run.runId, 'deploy'), 'proof.json'),
-    phase: 'deploy',
-    cwd: run.cwd,
-    dataDir,
-    expectedDigest: digest,
-    expectedGitSha: gitSha,
-    expectedRunId: run.runId,
-    expectedTarget: target,
-  })
-  if (!deploy.valid) throw new Error(`Current deploy evidence is required: ${deploy.reason}`)
-  if (
-    deploy.proof.remote !== predeploy.proof.remote
-    || deploy.proof.branch !== predeploy.proof.branch
-  ) throw new Error('Named remote or branch changed between release phases')
-  if (
-    requiredTimestamp(deploy.proof.startedAt, 'deploy')
-    <= requiredTimestamp(predeploy.proof.completedAt, 'predeploy')
-  ) throw new Error('Deploy must start strictly after predeploy finishes')
-  return {
-    completedAt: requiredTimestamp(deploy.proof.completedAt, 'deploy'),
-    remote: predeploy.proof.remote,
-    branch: predeploy.proof.branch,
-    remoteSha: currentRemoteSha,
-  }
-}
-
-export async function runReleaseEvidence({
-  runId,
-  phase,
-  command,
-  remote = 'origin',
-  branch,
-  target,
-  timeoutSeconds = 900,
-  dataDir = defaultDataDir(),
-  env = process.env,
-}) {
-  const run = await loadRun({ runId, dataDir })
-  if (run.qaTier !== 'q1' || run.qaProfile !== 'deploy-fast') {
-    throw new Error('release evidence is only valid for q1 deploy-fast runs')
-  }
-  const normalizedPhase = String(phase || '').toLowerCase()
-  if (!RELEASE_PHASES.includes(normalizedPhase)) {
-    throw new Error(`release phase must be one of ${RELEASE_PHASES.join(', ')}`)
-  }
-  const normalizedCommand = normalizeEvidenceCommand(command, 'release')
-  const normalizedTimeout = Number(timeoutSeconds)
-  if (!Number.isInteger(normalizedTimeout) || normalizedTimeout < 1 || normalizedTimeout > MAX_TEST_TIMEOUT_SECONDS) {
-    throw new Error(`release timeout must be between 1 and ${MAX_TEST_TIMEOUT_SECONDS} seconds`)
-  }
-  const workers = await listWorkerRecords({ runId, dataDir })
-  if (workers.some((worker) => !TERMINAL_STATES.has(worker.status))) {
-    throw new Error('All workers must reach a terminal state before release evidence')
-  }
-  const latestWriterAt = latestWriterCompletion(workers)
-  const snapshot = await gitRepositorySnapshot(run.cwd)
-  requireCleanReleaseSnapshot(snapshot)
-  const digest = await workspaceDigest(run.cwd)
-  const normalizedTarget = normalizedPhase === 'predeploy' ? null : normalizeReleaseTarget(target)
-  const requestedRemote = normalizedPhase === 'predeploy' ? normalizeRemote(remote) : null
-  const requestedBranch = normalizedPhase === 'predeploy'
-    ? await normalizeBranch(snapshot.root, branch)
-    : null
-  const requestedRemoteSha = normalizedPhase === 'predeploy'
-    ? await gitRemoteBranchSha(snapshot.root, requestedRemote, requestedBranch)
-    : null
-  if (requestedRemoteSha && requestedRemoteSha !== snapshot.gitSha) {
-    throw new Error(`Local HEAD does not match ${requestedRemote}/${requestedBranch}`)
-  }
-
-  const prefix = await validateReleasePrefix({
-    phase: normalizedPhase,
-    run,
-    dataDir,
-    digest,
-    gitSha: snapshot.gitSha,
-    latestWriterAt,
-    target: normalizedTarget,
-  })
-  const normalizedRemote = requestedRemote || prefix.remote
-  const normalizedBranch = requestedBranch || prefix.branch
-  const remoteShaBefore = requestedRemoteSha || prefix.remoteSha
-  const boundCommand = normalizedPhase === 'predeploy'
-    ? bindPredeployCommand(normalizedCommand, snapshot.gitSha)
-    : normalizedCommand
-  const targetPhaseDir = releasePhaseDir(dataDir, runId, normalizedPhase)
-  if (await optionalStat(targetPhaseDir)) {
-    throw new Error(`Release evidence already exists for phase ${normalizedPhase}`)
-  }
-  await mkdir(targetPhaseDir, { mode: 0o700 })
-  const stdoutPath = path.join(targetPhaseDir, 'stdout.log')
-  const stderrPath = path.join(targetPhaseDir, 'stderr.log')
-  const proofPath = path.join(targetPhaseDir, 'proof.json')
-  const startedAt = await strictlyLaterIso(prefix.completedAt)
-  const outcome = await runBoundedCommand({
-    command: boundCommand,
-    cwd: run.cwd,
-    env: {
-      ...env,
-      GPT56_RELEASE_PHASE: normalizedPhase,
-      GPT56_RELEASE_GIT_SHA: snapshot.gitSha,
-      GPT56_RELEASE_TARGET: normalizedTarget || '',
-    },
-    timeoutSeconds: normalizedTimeout,
-    stdoutPath,
-    stderrPath,
-  })
-
-  let finalSnapshot = null
-  let completedDigest = null
-  let remoteSha = null
-  let postconditionError = null
-  try {
-    finalSnapshot = await gitRepositorySnapshot(run.cwd)
-    completedDigest = await workspaceDigest(run.cwd)
-    remoteSha = await gitRemoteBranchSha(
-      finalSnapshot.root,
-      normalizedRemote,
-      normalizedBranch,
-    )
-  } catch (error) {
-    postconditionError = error.message
-  }
-  const workspaceChanged = !finalSnapshot
-    || !completedDigest
-    || finalSnapshot.gitSha !== snapshot.gitSha
-    || completedDigest !== digest
-    || finalSnapshot.dirtyEntryCount > 0
-  const passed = outcome.code === 0
-    && outcome.signal === null
-    && outcome.timedOut === false
-    && outcome.outputLimitExceeded === false
-    && !postconditionError
-    && workspaceChanged === false
-    && remoteShaBefore === snapshot.gitSha
-    && remoteSha === snapshot.gitSha
-  const completedAt = new Date().toISOString()
-  const proof = {
-    schemaVersion: 1,
-    status: passed ? 'passed' : 'failed',
-    runId,
-    phase: normalizedPhase,
-    qaProfile: 'deploy-fast',
-    command: boundCommand,
-    shaBound: normalizedPhase === 'predeploy' ? true : null,
-    exitCode: outcome.code,
-    signal: outcome.signal,
-    error: [outcome.error, postconditionError].filter(Boolean).join('; ') || null,
-    timedOut: outcome.timedOut,
-    outputLimitExceeded: outcome.outputLimitExceeded,
-    gitSha: snapshot.gitSha,
-    localSha: snapshot.gitSha,
-    remote: normalizedRemote,
-    branch: normalizedBranch,
-    remoteShaBefore,
-    remoteSha,
-    target: normalizedTarget,
-    workspaceDigestStarted: digest,
-    workspaceDigest: completedDigest,
-    workspaceChanged,
-    startedAt,
-    completedAt,
-    stdoutPath,
-    stderrPath,
-  }
-  await writeJsonAtomic(proofPath, proof)
-  return { ...proof, proofPath }
-}
-
-export async function runTestEvidence({
-  runId,
-  testId,
-  command,
-  timeoutSeconds = 900,
-  dataDir = defaultDataDir(),
-  env = process.env,
-}) {
-  const run = await loadRun({ runId, dataDir })
-  const normalizedTestId = assertIdentifier(testId, 'test id')
-  const normalizedCommand = normalizeTestCommand(command)
-  const normalizedTimeout = Number(timeoutSeconds)
-  if (!Number.isInteger(normalizedTimeout) || normalizedTimeout < 1 || normalizedTimeout > MAX_TEST_TIMEOUT_SECONDS) {
-    throw new Error(`test timeout must be between 1 and ${MAX_TEST_TIMEOUT_SECONDS} seconds`)
-  }
-  await ensurePrivateDirectory(testsDir(dataDir, runId))
-  const targetTestDir = testDir(dataDir, runId, normalizedTestId)
-  if (await optionalStat(targetTestDir)) throw new Error(`Test evidence already exists: ${normalizedTestId}`)
-  await mkdir(targetTestDir, { mode: 0o700 })
-  const stdoutPath = path.join(targetTestDir, 'stdout.log')
-  const stderrPath = path.join(targetTestDir, 'stderr.log')
-  const proofPath = path.join(targetTestDir, 'proof.json')
-  const startedAt = new Date().toISOString()
-  const workspaceDigestStarted = await workspaceDigest(run.cwd)
-  const stdoutHandle = await open(stdoutPath, 'w', 0o600)
-  const stderrHandle = await open(stderrPath, 'w', 0o600)
-  let outcome
-  try {
-    outcome = await new Promise((resolve) => {
-      let settled = false
-      let timedOut = false
-      const child = spawn(normalizedCommand[0], normalizedCommand.slice(1), {
-        cwd: run.cwd,
-        env,
-        stdio: ['ignore', stdoutHandle.fd, stderrHandle.fd],
-      })
-      const timer = setTimeout(() => {
-        timedOut = true
-        child.kill('SIGTERM')
-      }, normalizedTimeout * 1000)
-      child.once('error', (error) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        resolve({ code: null, signal: null, error: error.message, timedOut })
-      })
-      child.once('close', (code, signal) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        resolve({ code, signal, error: timedOut ? 'test timed out' : null, timedOut })
-      })
-    })
-  } finally {
-    await stdoutHandle.close()
-    await stderrHandle.close()
-  }
-  const completedAt = new Date().toISOString()
-  const completedWorkspaceDigest = await workspaceDigest(run.cwd)
-  const passed = outcome.code === 0 && outcome.signal === null && outcome.timedOut !== true
-  const proof = {
-    schemaVersion: 1,
-    status: passed ? 'passed' : 'failed',
-    runId,
-    testId: normalizedTestId,
-    command: normalizedCommand,
-    exitCode: outcome.code,
-    signal: outcome.signal,
-    error: outcome.error,
-    timedOut: outcome.timedOut,
-    workspaceDigestStarted,
-    workspaceDigest: completedWorkspaceDigest,
-    workspaceChanged: workspaceDigestStarted !== completedWorkspaceDigest,
-    startedAt,
-    completedAt,
-    stdoutPath,
-    stderrPath,
-  }
-  await writeJsonAtomic(proofPath, proof)
-  return { ...proof, proofPath }
-}
-
-async function listTestProofPaths({ runId, dataDir }) {
-  const root = testsDir(dataDir, runId)
-  const info = await optionalStat(root)
-  if (!info) return []
-  await assertContainedPath(runsDir(dataDir), root, { type: 'directory' })
-  const entries = await readdir(root, { withFileTypes: true })
-  return entries
-    .map((entry) => {
-      if (entry.isSymbolicLink()) throw new Error(`Unsafe symlinked test directory: ${entry.name}`)
-      return entry
-    })
-    .filter((entry) => entry.isDirectory() && IDENTIFIER.test(entry.name))
-    .map((entry) => path.join(root, entry.name, 'proof.json'))
-}
-
-export async function closeRun({
-  runId,
-  solVerdict,
-  acceptWorkerFailures = false,
-  dataDir = defaultDataDir(),
-}) {
-  const run = await loadRun({ runId, dataDir })
-  if (solVerdict !== 'accepted') throw new Error('Sol must explicitly pass --sol-verdict accepted')
-  const ledgerPath = await findLedger(run.cwd)
-  if (!ledgerPath) throw new Error('Create and close .workflow/LEDGER.md before QA closure')
-  const ledger = parseLedger(await readLedger(ledgerPath))
-  if (ledger.qaTier !== run.qaTier) {
-    throw new Error(`Run tier ${run.qaTier} does not match ledger tier ${ledger.qaTier || 'missing'}`)
-  }
-  const ledgerProfile = normalizeQaProfile(ledger.qaProfile || 'standard', run.qaTier)
-  if (ledgerProfile !== run.qaProfile) {
-    throw new Error(`Run profile ${run.qaProfile} does not match ledger profile ${ledgerProfile}`)
-  }
-  if (ledger.totalItems === 0 || ledger.openItems.length > 0) {
-    throw new Error(`Ledger must have no open items (${ledger.openItems.length} open)`)
-  }
-  const workers = await listWorkerRecords({ runId, dataDir })
-  const activeWorkers = workers.filter((worker) => !TERMINAL_STATES.has(worker.status))
-  if (activeWorkers.length > 0) throw new Error('All workers must reach a terminal state before closure')
-  const nonSuccessfulWorkers = workers.filter((worker) => worker.status !== 'completed')
-  if (nonSuccessfulWorkers.length > 0 && !acceptWorkerFailures) {
-    throw new Error('Stopped or failed workers require --accept-worker-failures')
-  }
-
-  const currentDigest = await workspaceDigest(run.cwd)
-  const tierPolicy = qaPolicy({ tier: run.qaTier, profile: run.qaProfile })
-  const latestWriterAt = latestWriterCompletion(workers)
-  let eligibleTests = []
-  const reviewByRole = new Map()
-  let releaseClosure = null
-
-  if (tierPolicy.releaseRequired) {
-    const predeployPath = path.join(releasePhaseDir(dataDir, runId, 'predeploy'), 'proof.json')
-    const deployPath = path.join(releasePhaseDir(dataDir, runId, 'deploy'), 'proof.json')
-    const smokePath = path.join(releasePhaseDir(dataDir, runId, 'smoke'), 'proof.json')
-    const deployProof = await readContainedBoundedJson(runsDir(dataDir), deployPath)
-    releaseClosure = {
-      predeploy: predeployPath,
-      deploy: deployPath,
-      smoke: smokePath,
-      target: deployProof.target,
-    }
-    const releaseResult = await validateReleaseEvidence({
-      release: releaseClosure,
-      cwd: run.cwd,
-      dataDir,
-      expectedDigest: currentDigest,
-      expectedRunId: runId,
-      latestWriterAt,
-    })
-    if (!releaseResult.valid) throw new Error(`deploy-fast release evidence is invalid: ${releaseResult.reason}`)
-  } else {
-    const currentTests = []
-    for (const proofPath of await listTestProofPaths({ runId, dataDir })) {
-      const result = await validateTestProofPath({
-        proofPath,
-        cwd: run.cwd,
-        dataDir,
-        expectedDigest: currentDigest,
-        expectedRunId: runId,
-      })
-      if (result.valid) currentTests.push({ ...result.proof, proofPath })
-    }
-    eligibleTests = currentTests.filter(
-      (proof) => requiredTimestamp(proof.startedAt, `test ${proof.testId}`) > latestWriterAt,
-    )
-    if (tierPolicy.testsRequired && eligibleTests.length === 0) {
-      throw new Error(`${run.qaTier.toUpperCase()} requires passing tests after write workers finish`)
-    }
-
-    const currentReviews = []
-    for (const worker of workers) {
-      if (!isQaReviewRole(worker.role) || !worker.proofPath) continue
-      const result = await validateWorkerProofPath({
-        proofPath: worker.proofPath,
-        cwd: run.cwd,
-        dataDir,
-        expectedDigest: currentDigest,
-        requireStable: true,
-        expectedRunId: runId,
-      })
-      if (result.valid) currentReviews.push({ ...result.proof, proofPath: worker.proofPath })
-    }
-    for (const proof of currentReviews) {
-      const prior = reviewByRole.get(proof.role)
-      if (
-        !prior
-        || requiredTimestamp(proof.completedAt, `review ${proof.workerId}`)
-          > requiredTimestamp(prior.completedAt, `review ${prior.workerId}`)
-      ) reviewByRole.set(proof.role, proof)
-    }
-    for (const role of tierPolicy.reviewRoles) {
-      if (!reviewByRole.has(role)) throw new Error(`${run.qaTier.toUpperCase()} requires ${role}`)
-    }
-    const latestTestAt = Math.max(0, ...eligibleTests.map(
-      (proof) => requiredTimestamp(proof.completedAt, `test ${proof.testId}`),
-    ))
-    for (const role of tierPolicy.reviewRoles) {
-      const proof = reviewByRole.get(role)
-      if (requiredTimestamp(proof.startedAt, `review ${proof.workerId}`) <= latestTestAt) {
-        throw new Error(`${role} must start strictly after direct tests finish`)
-      }
-    }
-    if (run.qaTier === 'q3') {
-      const terraCompletedAt = requiredTimestamp(
-        reviewByRole.get('orchestrator_terra_reviewer').completedAt,
-        'Terra review',
-      )
-      const solStartedAt = requiredTimestamp(
-        reviewByRole.get('orchestrator_sol_verifier').startedAt,
-        'Sol verification',
-      )
-      if (solStartedAt <= terraCompletedAt) {
-        throw new Error('Q3 Sol verification must start strictly after Terra review finishes')
-      }
-    }
-  }
-
-  const closurePath = path.join(path.dirname(ledgerPath), 'closure.json')
-  const existingClosure = await optionalStat(closurePath)
-  if (existingClosure?.isSymbolicLink() || (existingClosure && !existingClosure.isFile())) {
-    throw new Error('Unsafe .workflow/closure.json target')
-  }
-  const closure = {
-    schemaVersion: 1,
-    status: 'accepted',
-    runId,
-    qaTier: run.qaTier,
-    qaProfile: run.qaProfile,
-    workspaceDigest: currentDigest,
-    ledger: {
-      path: path.relative(run.cwd, ledgerPath),
-      totalItems: ledger.totalItems,
-      closedItems: ledger.closedItems,
-    },
-    tests: eligibleTests.map((proof) => proof.proofPath),
-    reviews: tierPolicy.reviewRoles.map((role) => reviewByRole.get(role).proofPath),
-    release: releaseClosure,
-    nonSuccessfulWorkers: nonSuccessfulWorkers.map((worker) => worker.workerId),
-    solVerdict: 'accepted',
-    createdAt: new Date().toISOString(),
-  }
-  await writeJsonAtomic(path.join(run.runDir, 'closure-receipt.json'), closure)
-  await writeJsonAtomic(closurePath, closure)
-  const validation = await validateClosure({ cwd: run.cwd, dataDir })
-  if (!validation.valid) throw new Error(`Generated closure failed validation: ${validation.reason}`)
-  return { ...closure, closurePath }
 }
 
 export async function waitForWorkers({
@@ -1314,26 +894,152 @@ export async function stopWorkers({ runId, workerId, dataDir = defaultDataDir() 
   return { runId, stopped }
 }
 
+export function renderDashboard(status) {
+  const counts = Object.entries(status.counts || {})
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([state, count]) => `${state}: ${count}`)
+    .join(', ') || 'none'
+  const rows = status.workers.length === 0
+    ? ['(no workers)']
+    : status.workers.map((worker) => {
+      const owns = worker.owns?.length ? worker.owns.join(',') : '-'
+      const handoff = worker.reportPath ? path.basename(worker.reportPath) : '-'
+      return `${worker.workerId}\t${worker.status}\t${worker.role}\t${owns}\t${handoff}`
+    })
+  return [
+    `Run: ${status.runId}`,
+    `Objective: ${status.objective}`,
+    `Controller: ${status.controller.model} ${status.controller.effort} (${status.controller.authority})`,
+    `Worker backend: ${status.workerBackend}`,
+    `Complete: ${status.complete ? 'yes' : 'no'}; successful: ${status.successful ? 'yes' : 'no'}; counts: ${counts}`,
+    '',
+    'Worker\tStatus\tRole\tOwns\tReport',
+    ...rows,
+  ].join('\n')
+}
+
+function normalizeIntervalMs(value) {
+  const interval = Number(value ?? 1000)
+  if (!Number.isInteger(interval) || interval < 10 || interval > 3_600_000) {
+    throw new Error('interval-ms must be an integer between 10 and 3600000')
+  }
+  return interval
+}
+
+function normalizePaneWidth(value) {
+  const width = Number(value ?? 40)
+  if (!Number.isInteger(width) || width < 20 || width > 80) {
+    throw new Error('width must be an integer percentage between 20 and 80')
+  }
+  return width
+}
+
+export async function runDashboard({
+  runId,
+  watch = false,
+  intervalMs = 1000,
+  dataDir = defaultDataDir(),
+  write = (value) => process.stdout.write(value),
+}) {
+  const normalizedInterval = normalizeIntervalMs(intervalMs)
+  do {
+    const status = await getRunStatus({ runId, dataDir })
+    if (watch) write('\x1Bc')
+    write(`${renderDashboard(status)}\n`)
+    if (!watch) return status
+    await delay(normalizedInterval)
+  } while (watch)
+  return null
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\\\"'\\\"'")}'`
+}
+
+export function buildPaneDashboardCommand({
+  runId,
+  intervalMs = 1000,
+  nodeBin = process.execPath,
+  dataDir = null,
+}) {
+  const normalizedRunId = assertIdentifier(runId, 'run id')
+  const normalizedInterval = normalizeIntervalMs(intervalMs)
+  const command = dataDir
+    ? ['env', `GPT56_ORCHESTRATOR_DATA_DIR=${path.resolve(dataDir)}`, nodeBin]
+    : [nodeBin]
+  return [...command, SCRIPT_PATH, 'dashboard', '--run', normalizedRunId, '--watch', '--interval-ms', normalizedInterval]
+    .map(shellQuote)
+    .join(' ')
+}
+
+function runChild(command, args, { env = process.env } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { env, stdio: ['ignore', 'pipe', 'pipe'] })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk) => { stdout += chunk })
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    child.once('error', reject)
+    child.once('close', (code, signal) => resolve({ code, signal, stdout, stderr }))
+  })
+}
+
+export async function openTmuxPane({
+  runId,
+  width = 40,
+  intervalMs = 1000,
+  env = process.env,
+}) {
+  const normalizedRunId = assertIdentifier(runId, 'run id')
+  if (!env.TMUX) throw new Error('pane requires an existing tmux client; run it from inside tmux')
+  const normalizedWidth = normalizePaneWidth(width)
+  const normalizedInterval = normalizeIntervalMs(intervalMs)
+  const tmuxBin = env.GPT56_ORCHESTRATOR_TMUX_BIN || 'tmux'
+  let client
+  try {
+    client = await runChild(tmuxBin, ['display-message', '-p', '#{client_tty}'], { env })
+  } catch (error) {
+    throw new Error(`pane requires an existing tmux client: ${error.message}`)
+  }
+  if (client.code !== 0 || !client.stdout.trim()) {
+    throw new Error(`pane requires an existing tmux client: ${client.stderr.trim() || 'tmux has no attached client'}`)
+  }
+  const command = buildPaneDashboardCommand({
+    runId,
+    intervalMs: normalizedInterval,
+    nodeBin: env.GPT56_ORCHESTRATOR_NODE_BIN || process.execPath,
+    dataDir: env.GPT56_ORCHESTRATOR_DATA_DIR || null,
+  })
+  const created = await runChild(tmuxBin, [
+    'split-window', '-h', '-d', '-p', String(normalizedWidth),
+    '-P', '-F', '#{pane_id}', command,
+  ], { env })
+  if (created.code !== 0) throw new Error(`Unable to open tmux dashboard pane: ${created.stderr.trim() || 'tmux split failed'}`)
+  const paneId = created.stdout.trim() || null
+  if (paneId) {
+    await runChild(tmuxBin, ['select-pane', '-t', paneId, '-T', 'GPT-5.6 agents'], { env })
+      .catch(() => {})
+  }
+  return { runId: normalizedRunId, paneId, width: normalizedWidth, intervalMs: normalizedInterval, command }
+}
+
 function parseArguments(argv) {
   const [command = 'help', ...rest] = argv
-  const separatorIndex = rest.indexOf('--')
-  const optionTokens = separatorIndex === -1 ? rest : rest.slice(0, separatorIndex)
-  const passthrough = separatorIndex === -1 ? [] : rest.slice(separatorIndex + 1)
   const options = {}
-  for (let index = 0; index < optionTokens.length; index += 1) {
-    const token = optionTokens[index]
+  for (let index = 0; index < rest.length; index += 1) {
+    const token = rest[index]
     if (!token.startsWith('--')) throw new Error(`Unexpected argument: ${token}`)
     const key = token.slice(2)
-    if (['allow-write', 'accept-worker-failures', 'json'].includes(key)) {
+    if (['allow-write', 'json', 'watch'].includes(key)) {
       options[key] = true
       continue
     }
-    const value = optionTokens[index + 1]
+    const value = rest[index + 1]
     if (value === undefined || value.startsWith('--')) throw new Error(`${token} requires a value`)
     options[key] = value
     index += 1
   }
-  return { command, options, passthrough }
+  return { command, options }
 }
 
 function printHelp() {
@@ -1341,13 +1047,11 @@ function printHelp() {
     'GPT-5.6 Orchestrator Codex worker controller',
     '',
     'Commands:',
-    '  create --cwd <dir> --objective <text> --qa-tier <q0|q1|q2|q3> [--qa-profile <standard|deploy-fast>] [--run-id <id>]',
-    '  spawn --run <id> --worker <id> --role <role> --task-file <path> [--allow-write]',
-    '  test --run <id> --test-id <id> [--timeout-seconds <n>] -- <command> [args...]',
-    '  release --run <id> --phase <predeploy|deploy|smoke> [--remote <name> --branch <name>] [--target <label>] [--timeout-seconds <n>] -- <command> [args...]',
-    '    predeploy commands must contain {sha} as a standalone argument',
-    '  close --run <id> --sol-verdict accepted [--accept-worker-failures]',
+    '  create --cwd <dir> --objective <text> [--run-id <id>]',
+    '  spawn --run <id> --worker <id> --role <role> --task-file <path> [--allow-write --owns <path[,path]>]',
     '  status --run <id> [--json]',
+    '  dashboard --run <id> [--watch] [--interval-ms <n>]',
+    '  pane --run <id> [--width <percent>] [--interval-ms <n>]',
     '  wait --run <id> [--worker <id>] [--timeout-seconds <n>] [--json]',
     '  stop --run <id> [--worker <id>]',
     '  roles',
@@ -1357,7 +1061,7 @@ function printHelp() {
 }
 
 async function main() {
-  const { command, options, passthrough } = parseArguments(process.argv.slice(2))
+  const { command, options } = parseArguments(process.argv.slice(2))
   const dataDir = defaultDataDir()
   let result
   if (command === 'create') {
@@ -1365,8 +1069,6 @@ async function main() {
       cwd: options.cwd,
       objective: options.objective,
       runId: options['run-id'],
-      qaTier: options['qa-tier'],
-      qaProfile: options['qa-profile'],
       dataDir,
     })
   } else if (command === 'spawn') {
@@ -1375,39 +1077,26 @@ async function main() {
       workerId: options.worker,
       role: options.role,
       taskFile: options['task-file'],
+      owns: options.owns,
       allowWrite: options['allow-write'] === true,
-      dataDir,
-    })
-  } else if (command === 'test') {
-    result = await runTestEvidence({
-      runId: options.run,
-      testId: options['test-id'],
-      command: passthrough,
-      timeoutSeconds: Number(options['timeout-seconds'] || 900),
-      dataDir,
-    })
-    if (result.status !== 'passed') process.exitCode = 1
-  } else if (command === 'release') {
-    result = await runReleaseEvidence({
-      runId: options.run,
-      phase: options.phase,
-      command: passthrough,
-      remote: options.remote || 'origin',
-      branch: options.branch,
-      target: options.target,
-      timeoutSeconds: Number(options['timeout-seconds'] || 900),
-      dataDir,
-    })
-    if (result.status !== 'passed') process.exitCode = 1
-  } else if (command === 'close') {
-    result = await closeRun({
-      runId: options.run,
-      solVerdict: options['sol-verdict'],
-      acceptWorkerFailures: options['accept-worker-failures'] === true,
       dataDir,
     })
   } else if (command === 'status') {
     result = await getRunStatus({ runId: options.run, dataDir })
+  } else if (command === 'dashboard') {
+    await runDashboard({
+      runId: options.run,
+      watch: options.watch === true,
+      intervalMs: options['interval-ms'] || 1000,
+      dataDir,
+    })
+    return
+  } else if (command === 'pane') {
+    result = await openTmuxPane({
+      runId: options.run,
+      width: options.width || 40,
+      intervalMs: options['interval-ms'] || 1000,
+    })
   } else if (command === 'wait') {
     result = await waitForWorkers({
       runId: options.run,

@@ -57,7 +57,16 @@ test('without git, an outside-home cwd cannot inherit a parent ledger', async ()
 })
 
 test('without git, an inside-home cwd can find its nearest home-scoped ledger', async (t) => {
-  const root = await mkdtemp(path.join(os.homedir(), '.codex-sol-fusion-ledger-'))
+  let root
+  try {
+    root = await mkdtemp(path.join(os.homedir(), '.codex-sol-fusion-ledger-'))
+  } catch (error) {
+    if (error?.code === 'EPERM' || error?.code === 'EACCES') {
+      t.skip('sandbox does not permit temporary fixtures in the home directory')
+      return
+    }
+    throw error
+  }
   t.after(() => rm(root, { recursive: true, force: true }))
   const cwd = path.join(root, 'nested')
   await mkdir(path.join(root, '.workflow'))
@@ -95,12 +104,10 @@ test('rejects a symlinked workflow directory that escapes the repository', async
 
 test('parses open, complete, and explicitly deferred items', () => {
   const parsed = parseLedger(`
-QA-Tier: Q2
-QA-Profile: deploy-fast
 - [ ] 1. Open item
 - [x] 2. Complete item
 * [X] 3. Complete too
-- [~] deferred: user approved later
+- [~] deferred: user-approved later
 - [~] not actually deferred
 - [ ]
 `)
@@ -111,8 +118,36 @@ QA-Profile: deploy-fast
   ])
   assert.equal(parsed.totalItems, 6)
   assert.equal(parsed.closedItems, 3)
-  assert.equal(parsed.qaTier, 'q2')
-  assert.equal(parsed.qaProfile, 'deploy-fast')
+})
+
+test('ignores fenced checkbox examples and requires the exact user-approved defer marker', () => {
+  const parsed = parseLedger(`
+- [ ] R1. Real requirement
+\`\`\`md
+- [x] R9. Example only
+\`\`\`
+~~~text
+- [ ] C1. Example only
+~~~
+- [~] deferred: user approved verbally
+- [~] deferred: user-approved in planning
+`)
+  assert.equal(parsed.totalItems, 3)
+  assert.equal(parsed.closedItems, 1)
+  assert.deepEqual(parsed.openItems, [
+    'R1. Real requirement',
+    'deferred: user approved verbally',
+  ])
+  assert.deepEqual(parsed.items.map((item) => item.id), ['R1', null, null])
+})
+
+test('extracts Fable numeric IDs and the final V item consistently', () => {
+  const parsed = parseLedger(`
+- [ ] 1. First requirement
+- [x] 2) Second requirement
+- [ ] V. Fresh-eyes closure
+`)
+  assert.deepEqual(parsed.items.map((item) => item.id), ['1', '2', 'V'])
 })
 
 test('allows a bootstrap patch only when every target is the ledger', () => {

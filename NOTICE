@@ -4,7 +4,7 @@ Copyright (c) 2026 Yusuf
 This project is inspired by fable5-orchestrator by Rylaa:
 https://github.com/Rylaa/fable5-orchestrator
 
-fable5-orchestrator is distributed under the MIT License. The orchestration
-concepts were adapted for Codex's plugin, hook, skill, agent-profile, and
-background subagent interfaces; Claude-specific code and lifecycle assumptions
+fable5-orchestrator is distributed under the MIT License. Its orchestration
+concepts were reimplemented for Codex's plugin, hook, skill, agent-profile, and
+background subagent interfaces; source implementation and lifecycle assumptions
 were not copied.

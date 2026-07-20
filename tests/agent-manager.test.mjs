@@ -10,6 +10,7 @@ import {
   checkAgentProfiles,
   installAgentProfiles,
   LEGACY_AGENT_PROFILE_FILES,
+  RETIRED_AGENT_PROFILE_FILES,
   removeAgentProfiles,
 } from '../scripts/manage-agent-profiles.mjs'
 
@@ -43,12 +44,9 @@ test('installs task-shaped Luna, Terra, and Sol worker profiles without a worker
   assert.deepEqual(AGENT_PROFILE_FILES, [
     'orchestrator-luna-gatherer.toml',
     'orchestrator-luna-worker.toml',
-    'orchestrator-luna-reviewer.toml',
     'orchestrator-terra-explorer.toml',
     'orchestrator-terra-worker.toml',
-    'orchestrator-terra-reviewer.toml',
     'orchestrator-sol-specialist.toml',
-    'orchestrator-sol-verifier.toml',
   ])
   assert.equal(AGENT_PROFILE_FILES.some((name) => name.includes('judge')), false)
   const codexHome = await makeCodexHome()
@@ -75,10 +73,26 @@ test('installs task-shaped Luna, Terra, and Sol worker profiles without a worker
     await readFile(path.join(codexHome, 'agents', 'orchestrator-sol-specialist.toml'), 'utf8'),
     /sandbox_mode = "workspace-write"/,
   )
-  assert.match(
-    await readFile(path.join(codexHome, 'agents', 'orchestrator-sol-verifier.toml'), 'utf8'),
-    /sandbox_mode = "read-only"/,
-  )
+  assert.equal((await checkAgentProfiles({ codexHome, pluginRoot })).ok, true)
+})
+
+test('removes retired managed reviewer and verifier profiles during install', async () => {
+  assert.deepEqual(RETIRED_AGENT_PROFILE_FILES, [
+    'orchestrator-luna-reviewer.toml',
+    'orchestrator-terra-reviewer.toml',
+    'orchestrator-sol-verifier.toml',
+  ])
+  const codexHome = await makeCodexHome()
+  const agentsDir = path.join(codexHome, 'agents')
+  await mkdir(agentsDir)
+  for (const filename of RETIRED_AGENT_PROFILE_FILES) {
+    await writeFile(path.join(agentsDir, filename), `${marker}\nname = "retired"\n`)
+  }
+
+  const before = await checkAgentProfiles({ codexHome, pluginRoot })
+  assert.deepEqual(before.retired, RETIRED_AGENT_PROFILE_FILES)
+  const result = await installAgentProfiles({ codexHome, pluginRoot })
+  assert.deepEqual(result.removedRetired, RETIRED_AGENT_PROFILE_FILES)
   assert.equal((await checkAgentProfiles({ codexHome, pluginRoot })).ok, true)
 })
 
