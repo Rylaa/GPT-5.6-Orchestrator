@@ -21,6 +21,9 @@ function runHook(action, input, env) {
     child.stderr.on('data', (chunk) => { stderr += chunk })
     child.on('error', reject)
     child.on('close', (code) => resolve({ code, stdout, stderr }))
+    child.stdin.on('error', (error) => {
+      if (error?.code !== 'EPIPE') reject(error)
+    })
     child.stdin.end(input)
   })
 }
