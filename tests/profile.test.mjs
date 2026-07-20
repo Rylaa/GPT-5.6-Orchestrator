@@ -83,7 +83,7 @@ test('allowlists model and effort combinations', () => {
   )
   assert.deepEqual(
     resolveReasoningRequest({ model: 'gpt-5.6-terra' }),
-    { model: 'gpt-5.6-terra', effort: 'medium' },
+    { model: 'gpt-5.6-terra', effort: 'max' },
   )
   assert.deepEqual(
     resolveReasoningRequest({ model: 'gpt-5.6-terra', effort: 'high' }),
@@ -91,7 +91,7 @@ test('allowlists model and effort combinations', () => {
   )
   assert.deepEqual(
     resolveReasoningRequest({ model: 'gpt-5.6-luna' }),
-    { model: 'gpt-5.6-luna', effort: 'medium' },
+    { model: 'gpt-5.6-luna', effort: 'max' },
   )
   assert.throws(
     () => resolveReasoningRequest({ model: 'gpt-5.6-luna', effort: 'ultra' }),

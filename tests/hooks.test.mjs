@@ -317,7 +317,7 @@ test('Stop blocks unproven worker claims and accepts a cited valid proof.json', 
   assert.equal(negative, null)
 })
 
-test('SubagentStop proof remains accepted only as a defensive native fallback', async () => {
+test('SubagentStop remains advisory and cannot replace exact controller proof', async () => {
   const fixture = await makeFixture()
   await submitPrompt(fixture)
   assert.equal(await handleHook('subagent-stop', basePayload(fixture.cwd, {
@@ -326,17 +326,14 @@ test('SubagentStop proof remains accepted only as a defensive native fallback', 
     agent_type: 'orchestrator_luna_gatherer',
   }), { env: {}, dataDir: fixture.dataDir, now: () => 2_000 }), null)
   const state = await readSessionState(fixture.dataDir, 'session-1')
-  assert.deepEqual(state.completedSeats, [{
-    agentId: 'agent-luna-1',
-    agentType: 'orchestrator_luna_gatherer',
-    turnId: 'turn-1',
-  }])
-  const proven = await handleHook('stop', basePayload(fixture.cwd, {
+  assert.equal(state.completedSeats, undefined)
+  const blocked = await handleHook('stop', basePayload(fixture.cwd, {
     turn_id: 'turn-1',
     stop_hook_active: false,
     last_assistant_message: 'orchestrator_luna_gatherer completed.',
   }), { env: {}, dataDir: fixture.dataDir, now: () => 2_100 })
-  assert.equal(proven, null)
+  assert.equal(blocked.decision, 'block')
+  assert.match(blocked.reason, /no valid runtime proof/i)
 })
 
 test('Stop recognizes Turkish claims, ignores descriptions, and avoids recursion', async () => {

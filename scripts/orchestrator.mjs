@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
 import {
   chmod,
@@ -14,13 +14,14 @@ import {
   rename,
   rm,
   unlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises'
-import os from 'node:os'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
+import { resolveOrchestratorDataDir } from '../lib/data-dir.mjs'
 import {
   MANAGED_AGENT_TYPES,
   resolveManagedAgentRole,
@@ -34,33 +35,44 @@ import {
 import {
   assertContainedPath,
   readContainedBoundedJson,
+  validateWorkerProofPath,
 } from '../lib/proof.mjs'
+import {
+  HANDOFF_FIELDS,
+  validateHandoffReport,
+  validateTaskContract as validateDetailedTaskContract,
+} from '../lib/task-contract.mjs'
+import {
+  parseRuntimeProofFile,
+  readLatestActivity,
+} from '../lib/runtime-events.mjs'
+import {
+  captureWorkspaceSnapshot,
+  resolveGitWorkspace,
+  validateSnapshotOwnership,
+} from '../lib/workspace-snapshot.mjs'
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url)
 const IDENTIFIER = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/
 const TERMINAL_STATES = new Set(['completed', 'failed', 'stopped'])
 const MAX_TASK_BYTES = 128 * 1024
+const MAX_REPORT_BYTES = 1024 * 1024
 const MAX_CONCURRENCY = 8
 const DETAILED_TASK_THRESHOLD = 1500
+const DEFAULT_EXECUTION_TIMEOUT_SECONDS = 1800
+const MAX_EXECUTION_TIMEOUT_SECONDS = 86_400
+const PROCESS_HEARTBEAT_STALE_MS = 10_000
+const CONTROLLER_LOCK_STALE_MS = 30_000
 const CONTROLLER_CONTRACT = Object.freeze({
   model: 'gpt-5.6-sol',
   effort: 'max',
   authority: 'main-session',
+  attestation: 'declared-main-session-contract',
 })
 const WORKER_BACKEND = 'codex-exec-background'
-const HANDOFF_FIELDS = Object.freeze([
-  'Ledger items addressed and scope',
-  'Evidence and files changed',
-  'Verification result',
-  'Risks and unresolved issues',
-  'Confidence and out-of-scope findings',
-])
 
 export function defaultDataDir(env = process.env) {
-  return path.resolve(
-    env.GPT56_ORCHESTRATOR_DATA_DIR
-      || path.join(os.homedir(), '.local', 'share', 'gpt-5-6-orchestrator'),
-  )
+  return resolveOrchestratorDataDir({ env, modulePath: SCRIPT_PATH })
 }
 
 function assertIdentifier(value, label) {
@@ -81,6 +93,7 @@ function assertControllerContract(manifest) {
     || controller.model !== CONTROLLER_CONTRACT.model
     || controller.effort !== CONTROLLER_CONTRACT.effort
     || controller.authority !== CONTROLLER_CONTRACT.authority
+    || (manifest.schemaVersion >= 2 && controller.attestation !== CONTROLLER_CONTRACT.attestation)
     || manifest.workerBackend !== WORKER_BACKEND
   ) {
     throw new Error('Invalid Orchestrator run controller contract')
@@ -131,6 +144,83 @@ async function writeJsonAtomic(targetPath, value) {
   }
 }
 
+async function withControllerLock(dataDir, callback) {
+  await ensurePrivateDirectory(dataDir)
+  const lockPath = path.join(dataDir, '.controller-lock')
+  const ownerPath = path.join(lockPath, 'owner-token')
+  const ownerToken = randomUUID()
+  let acquired = false
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      await mkdir(lockPath, { mode: 0o700 })
+      try {
+        await writeFile(ownerPath, ownerToken, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+      } catch (error) {
+        await rm(lockPath, { recursive: true, force: true }).catch(() => {})
+        throw error
+      }
+      acquired = true
+      break
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error
+      const info = await optionalStat(lockPath)
+      if (info && Date.now() - info.mtimeMs > CONTROLLER_LOCK_STALE_MS) {
+        const stalePath = `${lockPath}.stale-${randomUUID()}`
+        try {
+          await rename(lockPath, stalePath)
+          await rm(stalePath, { recursive: true, force: true })
+        } catch (staleError) {
+          if (!['ENOENT', 'EEXIST'].includes(staleError?.code)) throw staleError
+        }
+        continue
+      }
+      await delay(25)
+    }
+  }
+  if (!acquired) throw new Error('Timed out acquiring the Orchestrator controller lock')
+  const refreshTimer = setInterval(() => {
+    readFile(ownerPath, 'utf8')
+      .then((currentToken) => {
+        if (currentToken !== ownerToken) return null
+        const now = new Date()
+        return utimes(lockPath, now, now)
+      })
+      .catch(() => {})
+  }, Math.floor(CONTROLLER_LOCK_STALE_MS / 3))
+  refreshTimer.unref?.()
+  try {
+    return await callback()
+  } finally {
+    clearInterval(refreshTimer)
+    const currentToken = await readFile(ownerPath, 'utf8').catch(() => null)
+    if (currentToken === ownerToken) {
+      await rm(lockPath, { recursive: true, force: true })
+    }
+  }
+}
+
+function normalizeExecutionTimeout(value) {
+  const timeout = Number(value ?? DEFAULT_EXECUTION_TIMEOUT_SECONDS)
+  if (
+    !Number.isInteger(timeout)
+    || timeout < 1
+    || timeout > MAX_EXECUTION_TIMEOUT_SECONDS
+  ) {
+    throw new Error(`execution timeout must be an integer between 1 and ${MAX_EXECUTION_TIMEOUT_SECONDS}`)
+  }
+  return timeout
+}
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error?.code === 'EPERM'
+  }
+}
+
 function timestampId() {
   return new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14)
 }
@@ -147,7 +237,12 @@ function workerDir(dataDir, runId, workerId) {
   return path.join(runDir(dataDir, runId), 'workers', assertIdentifier(workerId, 'worker id'))
 }
 
-export async function createRun({ cwd, objective, runId, dataDir = defaultDataDir() }) {
+export async function createRun(options) {
+  const dataDir = options.dataDir ?? defaultDataDir()
+  return withControllerLock(dataDir, () => createRunUnlocked({ ...options, dataDir }))
+}
+
+async function createRunUnlocked({ cwd, objective, runId, dataDir }) {
   const resolvedCwd = await realpath(path.resolve(cwd || process.cwd()))
   const cwdInfo = await lstat(resolvedCwd)
   if (!cwdInfo.isDirectory()) throw new Error(`Working directory is not a directory: ${resolvedCwd}`)
@@ -166,7 +261,7 @@ export async function createRun({ cwd, objective, runId, dataDir = defaultDataDi
   await mkdir(targetRunDir, { mode: 0o700 })
   await mkdir(path.join(targetRunDir, 'workers'), { mode: 0o700 })
   const manifest = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     runId: normalizedRunId,
     objective: normalizedObjective,
     cwd: resolvedCwd,
@@ -264,88 +359,12 @@ async function copyTaskFile({ sourcePath, destinationPath, cwd }) {
   }
 }
 
-function sectionValue(task, names) {
-  const lines = String(task).split(/\r?\n/)
-  for (let index = 0; index < lines.length; index += 1) {
-    const match = lines[index].match(/^\s*#*\s*([^:\n]+):\s*(.*)$/)
-    if (!match || !names.includes(match[1].trim().toLowerCase())) continue
-    const values = [match[2].trim()].filter(Boolean)
-    for (let next = index + 1; next < lines.length; next += 1) {
-      if (/^\s*#*\s*[^:\n]+:\s*/.test(lines[next])) break
-      if (lines[next].trim()) values.push(lines[next].trim())
-    }
-    return values.join('\n').trim()
-  }
-  return ''
-}
-
-function hasSectionHeader(task, names) {
-  return String(task).split(/\r?\n/).some((line) => {
-    const match = line.match(/^\s*#*\s*([^:\n]+):/)
-    return match && names.includes(match[1].trim().toLowerCase())
-  })
-}
-
-function referencedLedgerIds(value) {
-  const source = String(value).toUpperCase()
-  const ids = []
-  const ranges = /\b([A-Z]*)(\d+)\s*-\s*([A-Z]*)(\d+)\b/g
-  for (const match of source.matchAll(ranges)) {
-    const leftPrefix = match[1]
-    const rightPrefix = match[3] || leftPrefix
-    const start = Number(match[2])
-    const end = Number(match[4])
-    if (leftPrefix !== rightPrefix || end < start || end - start > 100) {
-      throw new Error(`Invalid ledger item range: ${match[0]}`)
-    }
-    for (let current = start; current <= end; current += 1) {
-      ids.push(`${leftPrefix}${current}`)
-    }
-  }
-  const withoutRanges = source.replace(ranges, ' ')
-  ids.push(...(withoutRanges.match(/\b(?:[A-Z]+\d+|V|\d+)\b/g) || []))
-  return [...new Set(ids)]
-}
-
 export function validateTaskContract({ task, ledger = null }) {
-  const normalizedTask = String(task || '')
-  const headingNames = [
-    'ledger items', 'objective', 'inputs', 'allowed files', 'allowed files/systems',
-    'allowed scope', 'acceptance checks', 'return exactly',
-  ]
-  const detailed = normalizedTask.length > DETAILED_TASK_THRESHOLD
-    || hasSectionHeader(normalizedTask, headingNames)
-  if (!detailed) return { detailed: false, ledgerIds: [] }
-  if (normalizedTask.length > DETAILED_TASK_THRESHOLD && !ledger) {
-    throw new Error(`Detailed task files above ${DETAILED_TASK_THRESHOLD} characters require a ledger`)
-  }
-
-  const required = [
-    ['ledger items'],
-    ['objective'],
-    ['inputs'],
-    ['allowed files', 'allowed files/systems', 'allowed scope'],
-    ['acceptance checks'],
-  ]
-  for (const names of required) {
-    if (!sectionValue(normalizedTask, names)) {
-      throw new Error(`Detailed task contract is missing ${names[0]}`)
-    }
-  }
-  const returnContract = sectionValue(normalizedTask, ['return exactly'])
-  if (!returnContract || !HANDOFF_FIELDS.every((field) => returnContract.includes(field))) {
-    throw new Error('Detailed task contract must require the exact five-field return')
-  }
-  const ids = referencedLedgerIds(sectionValue(normalizedTask, ['ledger items']))
-  if (ids.length === 0) throw new Error('Detailed task contract must cite ledger item IDs')
-  if (ledger) {
-    const knownIds = ledgerItemIds(ledger.content)
-    const missing = ids.filter((id) => !knownIds.has(id))
-    if (missing.length) {
-      throw new Error(`Task cites ledger IDs that do not exist: ${missing.join(', ')}`)
-    }
-  }
-  return { detailed: true, ledgerIds: ids }
+  return validateDetailedTaskContract({
+    task,
+    detailedThreshold: DETAILED_TASK_THRESHOLD,
+    ledger: ledger ? { ids: ledgerItemIds(ledger.content) } : null,
+  })
 }
 
 async function findRunLedger(cwd) {
@@ -434,19 +453,120 @@ async function listWorkerRecords({ runId, dataDir }) {
   return records.sort((left, right) => left.workerId.localeCompare(right.workerId))
 }
 
+async function listAllWorkerRecords(dataDir) {
+  const root = runsDir(dataDir)
+  const rootInfo = await optionalStat(root)
+  if (!rootInfo) return []
+  await assertContainedPath(root, root, { type: 'directory' })
+  const entries = await readdir(root, { withFileTypes: true })
+  const records = []
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) throw new Error(`Unsafe symlinked run directory: ${entry.name}`)
+    if (!entry.isDirectory() || !IDENTIFIER.test(entry.name)) continue
+    const run = await loadRun({ runId: entry.name, dataDir })
+    for (const worker of await listWorkerRecords({ runId: entry.name, dataDir })) {
+      records.push({ ...worker, runCwd: run.cwd })
+    }
+  }
+  return records
+}
+
 async function writeWorkerRecord(dataDir, runId, workerId, record) {
   await writeJsonAtomic(path.join(workerDir(dataDir, runId, workerId), 'worker.json'), record)
 }
 
-export async function materializeWorker({
+async function verifiedHeartbeat(dataDir, worker, now = Date.now()) {
+  const expectedPath = path.join(workerDir(dataDir, worker.runId, worker.workerId), 'heartbeat.json')
+  if (worker.heartbeatPath !== expectedPath || !worker.processToken) return null
+  try {
+    const heartbeat = await readContainedBoundedJson(runsDir(dataDir), expectedPath)
+    const atMs = Date.parse(heartbeat.at)
+    if (
+      heartbeat.processToken !== worker.processToken
+      || heartbeat.pid !== worker.pid
+      || !Number.isFinite(atMs)
+      || now - atMs > PROCESS_HEARTBEAT_STALE_MS
+      || !isProcessAlive(Number(heartbeat.pid))
+    ) return null
+    return heartbeat
+  } catch {
+    return null
+  }
+}
+
+async function reconcileWorkerRecordUnlocked(dataDir, worker, now = Date.now()) {
+  if (worker.status === 'completed' && worker.schemaVersion >= 2) {
+    const validation = await validateWorkerProofPath({
+      proofPath: worker.proofPath,
+      cwd: worker.runCwd,
+      dataDir,
+      expectedRunId: worker.runId,
+    })
+    if (validation.valid) return worker
+    const failedAt = new Date(now).toISOString()
+    const failed = {
+      ...worker,
+      status: 'failed',
+      error: `completed worker proof is invalid: ${validation.reason}`,
+      completedAt: failedAt,
+      updatedAt: failedAt,
+    }
+    await writeWorkerRecord(dataDir, worker.runId, worker.workerId, failed)
+    return failed
+  }
+  if (TERMINAL_STATES.has(worker.status)) return worker
+  const updatedAtMs = Date.parse(worker.updatedAt || worker.createdAt)
+  const ageMs = Number.isFinite(updatedAtMs) ? now - updatedAtMs : Infinity
+  let failure = null
+  if (worker.status === 'queued' && ageMs > 30_000) {
+    const launcherPid = Number(worker.launcherPid)
+    if (!isProcessAlive(launcherPid)) failure = 'queued worker launcher is no longer running'
+  } else if (worker.status === 'running') {
+    const heartbeat = await verifiedHeartbeat(dataDir, worker, now)
+    if (!heartbeat && !isProcessAlive(Number(worker.pid))) {
+      failure = 'worker controller process is no longer running'
+    }
+  }
+  if (!failure) return worker
+  const failedAt = new Date(now).toISOString()
+  const failed = {
+    ...worker,
+    status: 'failed',
+    error: failure,
+    completedAt: failedAt,
+    updatedAt: failedAt,
+  }
+  await writeWorkerRecord(dataDir, worker.runId, worker.workerId, failed)
+  return failed
+}
+
+async function reconcileAllWorkersUnlocked(dataDir) {
+  const workers = await listAllWorkerRecords(dataDir)
+  const reconciled = []
+  for (const worker of workers) {
+    reconciled.push({
+      ...await reconcileWorkerRecordUnlocked(dataDir, worker),
+      runCwd: worker.runCwd,
+    })
+  }
+  return reconciled
+}
+
+export async function materializeWorker(options) {
+  const dataDir = options.dataDir ?? defaultDataDir()
+  return withControllerLock(dataDir, () => materializeWorkerUnlocked({ ...options, dataDir }))
+}
+
+async function materializeWorkerUnlocked({
   runId,
   workerId,
   role: roleName,
   taskFile,
   owns,
   allowWrite = false,
-  dataDir = defaultDataDir(),
-}) {
+  executionTimeoutSeconds = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+  dataDir,
+  }) {
   const run = await loadRun({ runId, dataDir })
   const normalizedWorkerId = assertIdentifier(workerId, 'worker id')
   const targetWorkerDir = workerDir(dataDir, runId, normalizedWorkerId)
@@ -464,13 +584,31 @@ export async function materializeWorker({
     throw new Error('Only write workers may declare --owns paths')
   }
   const normalizedOwns = role.sandbox === 'workspace-write' ? normalizeOwnsInput(owns) : []
+  const normalizedExecutionTimeout = normalizeExecutionTimeout(executionTimeoutSeconds)
   if (normalizedOwns.length) await assertOwnsPathsSafe(run.cwd, normalizedOwns)
-  const activeWorkers = (await listWorkerRecords({ runId, dataDir }))
+  const workspaceRoot = role.sandbox === 'workspace-write'
+    ? (await resolveGitWorkspace(run.cwd)).gitRoot
+    : null
+  const activeWorkers = (await reconcileAllWorkersUnlocked(dataDir))
     .filter((worker) => !TERMINAL_STATES.has(worker.status))
   if (activeWorkers.length >= MAX_CONCURRENCY) {
-    throw new Error(`Run already has ${MAX_CONCURRENCY} active workers`)
+    throw new Error(`The controller already has ${MAX_CONCURRENCY} active workers across runs`)
   }
-  if (role.sandbox === 'workspace-write') assertWriteOwnershipAvailable(activeWorkers, normalizedOwns)
+  if (role.sandbox === 'workspace-write') {
+    const workspaceWriters = []
+    for (const worker of activeWorkers) {
+      if (worker.sandbox !== 'workspace-write') continue
+      const activeWorkspaceRoot = worker.workspaceRoot
+        || (await resolveGitWorkspace(worker.runCwd).catch(() => ({ gitRoot: worker.runCwd }))).gitRoot
+      if (activeWorkspaceRoot === workspaceRoot) workspaceWriters.push(worker)
+    }
+    assertWriteOwnershipAvailable(workspaceWriters, normalizedOwns)
+    if (workspaceWriters.length > 0) {
+      throw new Error(
+        `Workspace already has active write worker ${workspaceWriters[0].workerId}; use a separate Git worktree for parallel writers`,
+      )
+    }
+  }
   await mkdir(targetWorkerDir, { mode: 0o700 })
   const scratchPath = path.join(targetWorkerDir, 'scratch')
   await mkdir(scratchPath, { mode: 0o700 })
@@ -487,7 +625,7 @@ export async function materializeWorker({
     const taskContract = validateTaskContract({ task, ledger })
     const now = new Date().toISOString()
     const record = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       runId,
       workerId: normalizedWorkerId,
       role: roleName,
@@ -497,6 +635,9 @@ export async function materializeWorker({
       sandbox: role.sandbox,
       lane: role.lane,
       owns: normalizedOwns,
+      workspaceRoot,
+      executionTimeoutSeconds: normalizedExecutionTimeout,
+      processToken: randomUUID(),
       ledgerPath: ledger?.path ?? null,
       ledgerIds: taskContract.ledgerIds,
       status: 'queued',
@@ -523,6 +664,8 @@ export function buildCodexArguments({ role, cwd, outputPath, scratchPath }) {
     '--ignore-user-config',
     '--disable',
     'remote_plugin',
+    '--disable',
+    'plugins',
     '--json',
     '--color',
     'never',
@@ -551,14 +694,14 @@ export function buildCodexArguments({ role, cwd, outputPath, scratchPath }) {
 
 function workerPrompt({ run, record, role, task }) {
   const handoff = role.sandbox === 'workspace-write'
-    ? `Private handoff paths: the controller grants ${record.scratchPath} as an additional writable directory for bulky evidence and captures your final five-field response at ${record.reportPath}. Never write outside the assigned repository ownership and that scratch directory.`
+    ? `Exact repository ownership: ${record.owns.join(', ')}. Private handoff paths: the controller grants ${record.scratchPath} as an additional writable directory for bulky evidence and captures your final five-field response at ${record.reportPath}. Never write outside the exact ownership list and that scratch directory; Git-visible escape invalidates proof.`
     : `Private handoff path: keep the repository read-only. The controller captures your final five-field response at ${record.reportPath}; use that durable report for evidence and do not attempt to write ${record.scratchPath}.`
   return [
     'You are a bounded worker launched by the GPT-5.6 Orchestrator controller.',
     'The main interactive session owns planning, task assignment, every consequential decision, and final acceptance; it must disclose if the required GPT-5.6 Sol max chair cannot be verified.',
     `Run objective: ${run.objective}`,
     `Worker role: ${record.role}`,
-    `Pinned runtime: ${role.model}, reasoning effort ${role.effort}, service tier fast, sandbox ${role.sandbox}.`,
+    `Requested launch contract: ${role.model}, reasoning effort ${role.effort}, service tier fast, sandbox ${role.sandbox}, hard timeout ${record.executionTimeoutSeconds} seconds.`,
     `Role contract: ${role.instructions}`,
     handoff,
     '',
@@ -567,26 +710,47 @@ function workerPrompt({ run, record, role, task }) {
   ].join('\n')
 }
 
-function parseRuntimeProof(events) {
-  let threadId = null
-  let completed = false
-  let usage = null
-  for (const line of events.split(/\r?\n/)) {
-    if (!line.trim()) continue
-    try {
-      const event = JSON.parse(line)
-      if (event.type === 'thread.started' && typeof event.thread_id === 'string') {
-        threadId = event.thread_id
-      }
-      if (event.type === 'turn.completed') {
-        completed = true
-        usage = event.usage ?? usage
-      }
-    } catch {
-      // Codex JSONL may contain a malformed diagnostic line; retain the raw log.
+async function reportEvidence(outputPath) {
+  try {
+    const info = await lstat(outputPath)
+    if (!info.isFile() || info.isSymbolicLink() || info.size === 0 || info.size > MAX_REPORT_BYTES) {
+      return { valid: false, size: info.size, reason: 'report must be a bounded regular non-symlink file' }
+    }
+    const content = await readFile(outputPath, 'utf8')
+    const contract = validateHandoffReport(content)
+    return {
+      ...contract,
+      size: info.size,
+      sha256: createHash('sha256').update(content).digest('hex'),
+    }
+  } catch (error) {
+    return { valid: false, size: 0, reason: error.message }
+  }
+}
+
+async function startHeartbeat({ dataDir, record, heartbeatPath }) {
+  let stopped = false
+  let timer = null
+  const write = async () => {
+    if (stopped) return
+    await writeJsonAtomic(heartbeatPath, {
+      schemaVersion: 1,
+      runId: record.runId,
+      workerId: record.workerId,
+      processToken: record.processToken,
+      pid: process.pid,
+      at: new Date().toISOString(),
+    })
+    if (!stopped) {
+      timer = setTimeout(() => { write().catch(() => {}) }, 1_000)
+      timer.unref?.()
     }
   }
-  return { threadId, completed, usage }
+  await write()
+  return () => {
+    stopped = true
+    if (timer) clearTimeout(timer)
+  }
 }
 
 export async function runWorker({ runId, workerId, dataDir = defaultDataDir(), env = process.env }) {
@@ -619,21 +783,43 @@ export async function runWorker({ runId, workerId, dataDir = defaultDataDir(), e
     throw new Error(`Worker role pin does not match its manifest: ${workerId}`)
   }
   const startedAt = new Date().toISOString()
-  record = {
-    ...record,
-    status: 'running',
-    backend: WORKER_BACKEND,
-    startedAt,
-    updatedAt: startedAt,
-    pid: process.pid,
-  }
-  await writeWorkerRecord(dataDir, runId, workerId, record)
   const eventsPath = path.join(targetWorkerDir, 'events.jsonl')
   const stderrPath = path.join(targetWorkerDir, 'stderr.log')
+  const heartbeatPath = path.join(targetWorkerDir, 'heartbeat.json')
+  const baselinePath = path.join(targetWorkerDir, 'workspace-baseline.json')
   const outputPath = record.reportPath
   if (await optionalStat(outputPath)) {
     throw new Error(`Worker report path must not already exist: ${outputPath}`)
   }
+  let baseline = null
+  if (role.sandbox === 'workspace-write') {
+    baseline = await captureWorkspaceSnapshot({
+      cwd: run.cwd,
+      extraPaths: [record.ledgerPath, record.sourceTaskPath],
+    })
+    await writeJsonAtomic(baselinePath, baseline)
+  }
+  record = await withControllerLock(dataDir, async () => {
+    const current = await readContainedBoundedJson(
+      runsDir(dataDir),
+      path.join(targetWorkerDir, 'worker.json'),
+    )
+    if (current.status !== 'queued') throw new Error(`Worker is not queued: ${workerId}`)
+    const running = {
+      ...current,
+      status: 'running',
+      backend: WORKER_BACKEND,
+      startedAt,
+      updatedAt: startedAt,
+      pid: process.pid,
+      heartbeatPath,
+      eventsPath,
+      stderrPath,
+      baselinePath: baseline ? baselinePath : null,
+    }
+    await writeWorkerRecord(dataDir, runId, workerId, running)
+    return running
+  })
   const task = await readFile(record.taskPath, 'utf8')
   const prompt = workerPrompt({ run, record, role, task })
   const args = buildCodexArguments({
@@ -645,7 +831,26 @@ export async function runWorker({ runId, workerId, dataDir = defaultDataDir(), e
   const codexBin = env.GPT56_ORCHESTRATOR_CODEX_BIN || 'codex'
   let eventsHandle
   let stderrHandle
+  let stopHeartbeat = null
+  let child = null
+  let timeoutTimer = null
+  let forceTimer = null
+  let terminationReason = null
+  const requestTermination = (reason, signal = 'SIGTERM') => {
+    terminationReason ||= reason
+    if (!child || child.exitCode !== null || child.signalCode !== null) return
+    child.kill(signal)
+    if (!forceTimer) {
+      forceTimer = setTimeout(() => {
+        if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      }, 2_000)
+      forceTimer.unref?.()
+    }
+  }
+  const onSigterm = () => requestTermination('controller-stop', 'SIGTERM')
+  const onSigint = () => requestTermination('controller-interrupt', 'SIGINT')
   try {
+    stopHeartbeat = await startHeartbeat({ dataDir, record, heartbeatPath })
     eventsHandle = await openPrivateOutput(eventsPath)
     stderrHandle = await openPrivateOutput(stderrPath)
     const workerEnv = {
@@ -654,13 +859,21 @@ export async function runWorker({ runId, workerId, dataDir = defaultDataDir(), e
     }
     const recursionGuard = {
       multiAgentDisabled: args.includes('features.multi_agent=false'),
+      pluginsDisabled: args.some((arg, index) => arg === '--disable' && args[index + 1] === 'plugins'),
       orchestratorHooksDisabled: workerEnv.GPT56_ORCHESTRATOR_DISABLE === '1',
     }
-    const child = spawn(codexBin, args, {
+    child = spawn(codexBin, args, {
       cwd: run.cwd,
       env: workerEnv,
       stdio: ['pipe', eventsHandle.fd, stderrHandle.fd],
     })
+    process.once('SIGTERM', onSigterm)
+    process.once('SIGINT', onSigint)
+    timeoutTimer = setTimeout(
+      () => requestTermination('execution-timeout'),
+      record.executionTimeoutSeconds * 1_000,
+    )
+    timeoutTimer.unref?.()
     const outcome = await new Promise((resolve, reject) => {
       let settled = false
       child.once('error', (error) => {
@@ -682,21 +895,66 @@ export async function runWorker({ runId, workerId, dataDir = defaultDataDir(), e
     await stderrHandle.close()
     eventsHandle = null
     stderrHandle = null
-    const events = await readFile(eventsPath, 'utf8')
-    const runtime = parseRuntimeProof(events)
-    const resultInfo = await optionalStat(outputPath)
+    if (timeoutTimer) clearTimeout(timeoutTimer)
+    if (forceTimer) clearTimeout(forceTimer)
+    process.removeListener('SIGTERM', onSigterm)
+    process.removeListener('SIGINT', onSigint)
+    stopHeartbeat?.()
+    stopHeartbeat = null
+    const runtime = await parseRuntimeProofFile(eventsPath).catch((error) => ({
+      threadId: null,
+      threadIds: [],
+      threadStartCount: 0,
+      completed: false,
+      completionCount: 0,
+      validLifecycle: false,
+      usage: null,
+      eventCount: 0,
+      malformedLines: 0,
+      bytes: 0,
+      error: error.message,
+    }))
+    const report = await reportEvidence(outputPath)
+    let ownership = {
+      mode: role.sandbox === 'workspace-write'
+        ? 'git-visible-plus-workflow-contracts'
+        : 'read-only-sandbox',
+      valid: true,
+      changedPaths: [],
+      outsidePaths: [],
+    }
+    if (baseline) {
+      try {
+        const after = await captureWorkspaceSnapshot({
+          cwd: run.cwd,
+          extraPaths: [record.ledgerPath, record.sourceTaskPath],
+        })
+        ownership = {
+          mode: 'git-visible-plus-workflow-contracts',
+          ...validateSnapshotOwnership({ before: baseline, after, owns: record.owns }),
+        }
+      } catch (error) {
+        ownership = {
+          mode: 'git-visible-plus-workflow-contracts',
+          valid: false,
+          changedPaths: [],
+          outsidePaths: [],
+          error: error.message,
+        }
+      }
+    }
     const success = outcome.code === 0
       && outcome.signal === null
-      && runtime.threadId
-      && runtime.completed
+      && terminationReason === null
+      && runtime.validLifecycle
       && recursionGuard.multiAgentDisabled
       && recursionGuard.orchestratorHooksDisabled
-      && resultInfo?.isFile()
-      && resultInfo.size > 0
+      && report.valid
+      && ownership.valid
     const completedAt = new Date().toISOString()
-    const proof = {
-      schemaVersion: 2,
-      status: success ? 'completed' : 'failed',
+    const proofPath = path.join(targetWorkerDir, 'proof.json')
+    const proofBase = {
+      schemaVersion: 3,
       runId,
       workerId,
       role: record.role,
@@ -711,6 +969,29 @@ export async function runWorker({ runId, workerId, dataDir = defaultDataDir(), e
       exitCode: outcome.code,
       signal: outcome.signal,
       usage: runtime.usage,
+      launchContract: {
+        source: 'controller-cli-request',
+        model: role.model,
+        effort: role.effort,
+        serviceTier: 'fast',
+        sandbox: role.sandbox,
+      },
+      runtimeEvidence: {
+        source: 'codex-json-events',
+        modelObserved: false,
+        effortObserved: false,
+        threadIds: runtime.threadIds,
+        threadStartCount: runtime.threadStartCount,
+        completionCount: runtime.completionCount,
+        eventCount: runtime.eventCount,
+        malformedLines: runtime.malformedLines,
+        bytes: runtime.bytes,
+        lifecycleValid: runtime.validLifecycle,
+        error: runtime.error ?? null,
+      },
+      reportContract: report,
+      ownership,
+      terminationReason,
       startedAt,
       completedAt,
       taskPath: record.taskPath,
@@ -719,26 +1000,50 @@ export async function runWorker({ runId, workerId, dataDir = defaultDataDir(), e
       resultPath: outputPath,
       eventsPath,
       stderrPath,
+      baselinePath: baseline ? baselinePath : null,
     }
-    const proofPath = path.join(targetWorkerDir, 'proof.json')
-    await writeJsonAtomic(proofPath, proof)
-    record = {
-      ...record,
-      status: proof.status,
-      threadId: proof.threadId,
-      completedAt,
-      updatedAt: completedAt,
-      proofPath,
-      resultPath: outputPath,
-      reportPath: outputPath,
-      scratchPath: record.scratchPath,
-      eventsPath,
-      stderrPath,
+    const finalized = await withControllerLock(dataDir, async () => {
+      const current = await readContainedBoundedJson(
+        runsDir(dataDir),
+        path.join(targetWorkerDir, 'worker.json'),
+      )
+      const finalStatus = current.status === 'stopped' ? 'stopped' : success ? 'completed' : 'failed'
+      const proof = { ...proofBase, status: finalStatus }
+      await writeJsonAtomic(proofPath, proof)
+      const finalRecord = {
+        ...(current.status === 'stopped' ? current : record),
+        status: finalStatus,
+        threadId: proof.threadId,
+        completedAt,
+        updatedAt: completedAt,
+        proofPath,
+        resultPath: outputPath,
+        reportPath: outputPath,
+        scratchPath: record.scratchPath,
+        eventsPath,
+        stderrPath,
+      }
+      await writeWorkerRecord(dataDir, runId, workerId, finalRecord)
+      return { finalRecord, proof }
+    })
+    record = finalized.finalRecord
+    const proof = finalized.proof
+    const finalStatus = proof.status
+    if (!success || finalStatus !== 'completed') {
+      const reason = finalStatus === 'stopped'
+        ? 'was stopped'
+        : terminationReason === 'execution-timeout'
+          ? `exceeded ${record.executionTimeoutSeconds} seconds`
+          : 'failed runtime, handoff, or ownership proof validation'
+      throw new Error(`Worker ${workerId} ${reason}`)
     }
-    await writeWorkerRecord(dataDir, runId, workerId, record)
-    if (!success) throw new Error(`Worker ${workerId} failed runtime proof validation`)
     return { ...proof, proofPath }
   } catch (error) {
+    if (timeoutTimer) clearTimeout(timeoutTimer)
+    if (forceTimer) clearTimeout(forceTimer)
+    process.removeListener('SIGTERM', onSigterm)
+    process.removeListener('SIGINT', onSigint)
+    stopHeartbeat?.()
     await eventsHandle?.close().catch(() => {})
     await stderrHandle?.close().catch(() => {})
     const failedAt = new Date().toISOString()
@@ -766,6 +1071,7 @@ export async function launchWorker({
   taskFile,
   owns,
   allowWrite = false,
+  executionTimeoutSeconds = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
   dataDir = defaultDataDir(),
   env = process.env,
 }) {
@@ -777,6 +1083,7 @@ export async function launchWorker({
     taskFile,
     owns,
     allowWrite,
+    executionTimeoutSeconds,
     dataDir,
   })
   const childEnv = {
@@ -804,6 +1111,20 @@ export async function launchWorker({
       child.once('error', reject)
     })
     child.unref()
+    await withControllerLock(dataDir, async () => {
+      const current = await readContainedBoundedJson(
+        runsDir(dataDir),
+        path.join(workerDir(dataDir, runId, workerId), 'worker.json'),
+      )
+      if (current.status !== 'queued') return
+      const launchRequestedAt = new Date().toISOString()
+      await writeWorkerRecord(dataDir, runId, workerId, {
+        ...current,
+        launcherPid: child.pid,
+        launchRequestedAt,
+        updatedAt: launchRequestedAt,
+      })
+    })
   } catch (error) {
     const failedAt = new Date().toISOString()
     await writeWorkerRecord(dataDir, runId, workerId, {
@@ -826,8 +1147,28 @@ export async function launchWorker({
 }
 
 export async function getRunStatus({ runId, dataDir = defaultDataDir() }) {
-  const run = await loadRun({ runId, dataDir })
-  const workers = await listWorkerRecords({ runId, dataDir })
+  const { run, records } = await withControllerLock(dataDir, async () => {
+    const loadedRun = await loadRun({ runId, dataDir })
+    const workers = await reconcileAllWorkersUnlocked(dataDir)
+    return { run: loadedRun, records: workers.filter((worker) => worker.runId === runId) }
+  })
+  const workers = await Promise.all(records.map(async (worker) => {
+    const {
+      processToken: _processToken,
+      runCwd: _runCwd,
+      ...publicRecord
+    } = worker
+    const activity = worker.eventsPath ? await readLatestActivity(worker.eventsPath) : null
+    const startedAtMs = Date.parse(worker.startedAt)
+    const endedAtMs = Date.parse(worker.completedAt)
+    return {
+      ...publicRecord,
+      activity,
+      elapsedMs: Number.isFinite(startedAtMs)
+        ? Math.max(0, (Number.isFinite(endedAtMs) ? endedAtMs : Date.now()) - startedAtMs)
+        : null,
+    }
+  }))
   const counts = workers.reduce((result, worker) => {
     result[worker.status] = (result[worker.status] || 0) + 1
     return result
@@ -867,34 +1208,56 @@ export async function waitForWorkers({
 }
 
 export async function stopWorkers({ runId, workerId, dataDir = defaultDataDir() }) {
-  await loadRun({ runId, dataDir })
-  const workers = await listWorkerRecords({ runId, dataDir })
-  const selected = workerId ? workers.filter((worker) => worker.workerId === workerId) : workers
-  if (workerId && selected.length === 0) throw new Error(`Unknown worker: ${workerId}`)
-  const stoppedAt = new Date().toISOString()
-  const stopped = []
-  for (const worker of selected) {
-    if (TERMINAL_STATES.has(worker.status)) continue
-    const pid = Number(worker.pid)
-    if (Number.isInteger(pid) && pid > 1) {
-      try {
-        process.kill(process.platform === 'win32' ? pid : -pid, 'SIGTERM')
-      } catch (error) {
-        if (error?.code !== 'ESRCH') throw error
-      }
+  const outcome = await withControllerLock(dataDir, async () => {
+    await loadRun({ runId, dataDir })
+    const workers = await reconcileAllWorkersUnlocked(dataDir)
+    const runWorkers = workers.filter((worker) => worker.runId === runId)
+    const selected = workerId
+      ? runWorkers.filter((worker) => worker.workerId === workerId)
+      : runWorkers
+    if (workerId && selected.length === 0) throw new Error(`Unknown worker: ${workerId}`)
+    const stoppedAt = new Date().toISOString()
+    const stopped = []
+    const signals = []
+    for (const worker of selected) {
+      if (TERMINAL_STATES.has(worker.status)) continue
+      const heartbeat = await verifiedHeartbeat(dataDir, worker)
+      await writeWorkerRecord(dataDir, runId, worker.workerId, {
+        ...worker,
+        status: 'stopped',
+        stopRequestedAt: stoppedAt,
+        completedAt: stoppedAt,
+        updatedAt: stoppedAt,
+        stopSignalVerified: Boolean(heartbeat),
+      })
+      if (heartbeat) signals.push({ workerId: worker.workerId, pid: heartbeat.pid })
+      stopped.push(worker.workerId)
     }
-    await writeWorkerRecord(dataDir, runId, worker.workerId, {
-      ...worker,
-      status: 'stopped',
-      completedAt: stoppedAt,
-      updatedAt: stoppedAt,
-    })
-    stopped.push(worker.workerId)
+    return { stopped, signals }
+  })
+  const signaled = []
+  for (const target of outcome.signals) {
+    try {
+      process.kill(target.pid, 'SIGTERM')
+      signaled.push(target.workerId)
+    } catch (error) {
+      if (error?.code !== 'ESRCH') throw error
+    }
   }
-  return { runId, stopped }
+  return { runId, stopped: outcome.stopped, signaled }
 }
 
 export function renderDashboard(status) {
+  const display = (value, limit = 96) => {
+    const normalized = String(value ?? '-').replace(/[\x00-\x1f\x7f]+/g, ' ').trim() || '-'
+    return normalized.length > limit ? `${normalized.slice(0, limit - 1)}…` : normalized
+  }
+  const elapsed = (value) => {
+    if (!Number.isFinite(value)) return '-'
+    const seconds = Math.max(0, Math.round(value / 1000))
+    const minutes = Math.floor(seconds / 60)
+    return minutes ? `${minutes}m${String(seconds % 60).padStart(2, '0')}s` : `${seconds}s`
+  }
   const counts = Object.entries(status.counts || {})
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([state, count]) => `${state}: ${count}`)
@@ -904,16 +1267,24 @@ export function renderDashboard(status) {
     : status.workers.map((worker) => {
       const owns = worker.owns?.length ? worker.owns.join(',') : '-'
       const handoff = worker.reportPath ? path.basename(worker.reportPath) : '-'
-      return `${worker.workerId}\t${worker.status}\t${worker.role}\t${owns}\t${handoff}`
+      return [
+        display(worker.workerId, 28),
+        display(worker.status, 12),
+        display(worker.role, 34),
+        elapsed(worker.elapsedMs),
+        display(worker.activity?.summary || (worker.status === 'queued' ? 'waiting to start' : '-'), 34),
+        display(owns, 40),
+        display(handoff, 24),
+      ].join('\t')
     })
   return [
     `Run: ${status.runId}`,
-    `Objective: ${status.objective}`,
-    `Controller: ${status.controller.model} ${status.controller.effort} (${status.controller.authority})`,
+    `Objective: ${display(status.objective, 120)}`,
+    `Controller: ${status.controller.model} ${status.controller.effort} (${status.controller.authority}; ${status.controller.attestation || 'legacy declaration'})`,
     `Worker backend: ${status.workerBackend}`,
     `Complete: ${status.complete ? 'yes' : 'no'}; successful: ${status.successful ? 'yes' : 'no'}; counts: ${counts}`,
     '',
-    'Worker\tStatus\tRole\tOwns\tReport',
+    'Worker\tStatus\tRole\tElapsed\tActivity\tOwns\tReport',
     ...rows,
   ].join('\n')
 }
@@ -937,6 +1308,7 @@ function normalizePaneWidth(value) {
 export async function runDashboard({
   runId,
   watch = false,
+  keepOpen = false,
   intervalMs = 1000,
   dataDir = defaultDataDir(),
   write = (value) => process.stdout.write(value),
@@ -946,7 +1318,7 @@ export async function runDashboard({
     const status = await getRunStatus({ runId, dataDir })
     if (watch) write('\x1Bc')
     write(`${renderDashboard(status)}\n`)
-    if (!watch) return status
+    if (!watch || (status.complete && !keepOpen)) return status
     await delay(normalizedInterval)
   } while (watch)
   return null
@@ -988,12 +1360,14 @@ export async function openTmuxPane({
   runId,
   width = 40,
   intervalMs = 1000,
+  dataDir = null,
   env = process.env,
 }) {
   const normalizedRunId = assertIdentifier(runId, 'run id')
   if (!env.TMUX) throw new Error('pane requires an existing tmux client; run it from inside tmux')
   const normalizedWidth = normalizePaneWidth(width)
   const normalizedInterval = normalizeIntervalMs(intervalMs)
+  const resolvedDataDir = dataDir ? path.resolve(dataDir) : defaultDataDir(env)
   const tmuxBin = env.GPT56_ORCHESTRATOR_TMUX_BIN || 'tmux'
   let client
   try {
@@ -1008,7 +1382,7 @@ export async function openTmuxPane({
     runId,
     intervalMs: normalizedInterval,
     nodeBin: env.GPT56_ORCHESTRATOR_NODE_BIN || process.execPath,
-    dataDir: env.GPT56_ORCHESTRATOR_DATA_DIR || null,
+    dataDir: resolvedDataDir,
   })
   const created = await runChild(tmuxBin, [
     'split-window', '-h', '-d', '-p', String(normalizedWidth),
@@ -1023,6 +1397,80 @@ export async function openTmuxPane({
   return { runId: normalizedRunId, paneId, width: normalizedWidth, intervalMs: normalizedInterval, command }
 }
 
+export async function pruneRuns({
+  olderThanHours,
+  apply = false,
+  dataDir = defaultDataDir(),
+  now = Date.now(),
+}) {
+  const hours = Number(olderThanHours)
+  if (!Number.isInteger(hours) || hours < 1 || hours > 87_600) {
+    throw new Error('older-than-hours must be an integer between 1 and 87600')
+  }
+  return withControllerLock(dataDir, async () => {
+    const workers = await reconcileAllWorkersUnlocked(dataDir)
+    const workerGroups = new Map()
+    for (const worker of workers) {
+      const group = workerGroups.get(worker.runId) || []
+      group.push(worker)
+      workerGroups.set(worker.runId, group)
+    }
+    const root = runsDir(dataDir)
+    if (!await optionalStat(root)) {
+      return {
+        dryRun: !apply,
+        olderThanHours: hours,
+        candidates: [],
+        skippedActive: [],
+        moved: [],
+        recoverableFrom: path.join(dataDir, 'trash'),
+      }
+    }
+    const entries = await readdir(root, { withFileTypes: true })
+    const cutoff = now - hours * 60 * 60 * 1000
+    const candidates = []
+    const skippedActive = []
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) throw new Error(`Unsafe symlinked run directory: ${entry.name}`)
+      if (!entry.isDirectory() || !IDENTIFIER.test(entry.name)) continue
+      const run = await loadRun({ runId: entry.name, dataDir })
+      const runWorkers = workerGroups.get(entry.name) || []
+      if (runWorkers.some((worker) => !TERMINAL_STATES.has(worker.status))) {
+        skippedActive.push(entry.name)
+        continue
+      }
+      const timestamps = [run.createdAt, ...runWorkers.flatMap((worker) => [
+        worker.updatedAt,
+        worker.completedAt,
+      ])]
+        .map(Date.parse)
+        .filter(Number.isFinite)
+      const latest = timestamps.length ? Math.max(...timestamps) : Infinity
+      if (latest <= cutoff) candidates.push(entry.name)
+    }
+    const moved = []
+    if (apply && candidates.length > 0) {
+      const trashRoot = path.join(dataDir, 'trash')
+      await ensurePrivateDirectory(trashRoot)
+      for (const runId of candidates) {
+        const source = runDir(dataDir, runId)
+        await assertContainedPath(root, source, { type: 'directory' })
+        const destination = path.join(trashRoot, `${runId}-${timestampId()}-${randomUUID().slice(0, 8)}`)
+        await rename(source, destination)
+        moved.push({ runId, destination })
+      }
+    }
+    return {
+      dryRun: !apply,
+      olderThanHours: hours,
+      candidates,
+      skippedActive,
+      moved,
+      recoverableFrom: path.join(dataDir, 'trash'),
+    }
+  })
+}
+
 function parseArguments(argv) {
   const [command = 'help', ...rest] = argv
   const options = {}
@@ -1030,7 +1478,7 @@ function parseArguments(argv) {
     const token = rest[index]
     if (!token.startsWith('--')) throw new Error(`Unexpected argument: ${token}`)
     const key = token.slice(2)
-    if (['allow-write', 'json', 'watch'].includes(key)) {
+    if (['allow-write', 'apply', 'json', 'keep-open', 'watch'].includes(key)) {
       options[key] = true
       continue
     }
@@ -1048,12 +1496,14 @@ function printHelp() {
     '',
     'Commands:',
     '  create --cwd <dir> --objective <text> [--run-id <id>]',
-    '  spawn --run <id> --worker <id> --role <role> --task-file <path> [--allow-write --owns <path[,path]>]',
+    '  spawn --run <id> --worker <id> --role <role> --task-file <path> [--allow-write --owns <path[,path]>] [--execution-timeout-seconds <n>]',
     '  status --run <id> [--json]',
-    '  dashboard --run <id> [--watch] [--interval-ms <n>]',
+    '  dashboard --run <id> [--watch] [--keep-open] [--interval-ms <n>]',
     '  pane --run <id> [--width <percent>] [--interval-ms <n>]',
     '  wait --run <id> [--worker <id>] [--timeout-seconds <n>] [--json]',
     '  stop --run <id> [--worker <id>]',
+    '  prune --older-than-hours <n> [--apply]',
+    '  data-dir',
     '  roles',
     '',
     `Roles: ${MANAGED_AGENT_TYPES.join(', ')}`,
@@ -1079,6 +1529,7 @@ async function main() {
       taskFile: options['task-file'],
       owns: options.owns,
       allowWrite: options['allow-write'] === true,
+      executionTimeoutSeconds: options['execution-timeout-seconds'] || DEFAULT_EXECUTION_TIMEOUT_SECONDS,
       dataDir,
     })
   } else if (command === 'status') {
@@ -1087,6 +1538,7 @@ async function main() {
     await runDashboard({
       runId: options.run,
       watch: options.watch === true,
+      keepOpen: options['keep-open'] === true,
       intervalMs: options['interval-ms'] || 1000,
       dataDir,
     })
@@ -1096,6 +1548,7 @@ async function main() {
       runId: options.run,
       width: options.width || 40,
       intervalMs: options['interval-ms'] || 1000,
+      dataDir,
     })
   } else if (command === 'wait') {
     result = await waitForWorkers({
@@ -1107,6 +1560,14 @@ async function main() {
     if (!result.selectedSuccessful) process.exitCode = 1
   } else if (command === 'stop') {
     result = await stopWorkers({ runId: options.run, workerId: options.worker, dataDir })
+  } else if (command === 'prune') {
+    result = await pruneRuns({
+      olderThanHours: options['older-than-hours'],
+      apply: options.apply === true,
+      dataDir,
+    })
+  } else if (command === 'data-dir') {
+    result = { dataDir }
   } else if (command === '_worker') {
     result = await runWorker({ runId: options.run, workerId: options.worker, dataDir })
   } else if (command === 'roles') {

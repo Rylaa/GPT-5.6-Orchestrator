@@ -1,16 +1,19 @@
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import {
   chmod,
   mkdir,
   mkdtemp,
   readFile,
   symlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import { promisify } from 'node:util'
 
 import { resolveManagedAgentRole } from '../lib/routing.mjs'
 import {
@@ -23,16 +26,21 @@ import {
   loadRun,
   materializeWorker,
   openTmuxPane,
+  pruneRuns,
   renderDashboard,
+  runDashboard,
   runWorker,
   stopWorkers,
   validateTaskContract,
   waitForWorkers,
 } from '../scripts/orchestrator.mjs'
 
+const execFileAsync = promisify(execFile)
+
 async function makeWorkspace() {
   const cwd = await mkdtemp(path.join(os.tmpdir(), 'g56o-workspace-'))
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'g56o-data-'))
+  await execFileAsync('git', ['init', '-q', cwd])
   await mkdir(path.join(cwd, '.workflow', 'tasks'), { recursive: true })
   return { cwd, dataDir }
 }
@@ -43,11 +51,18 @@ async function writeTask(cwd, name = 'task.md') {
   return taskPath
 }
 
-async function fakeCodex(root, { completed = true, exitCode = 0, delayMs = 0 } = {}) {
-  const executable = path.join(root, `fake-codex-${completed}-${exitCode}-${delayMs}.mjs`)
+async function fakeCodex(root, {
+  completed = true,
+  exitCode = 0,
+  delayMs = 0,
+  reportContent = '1. Ledger items addressed and scope: test\n2. Evidence and files changed: none\n3. Verification result: pass\n4. Risks and unresolved issues: none\n5. Confidence and out-of-scope findings: high\n',
+  writeRelative = null,
+} = {}) {
+  const executable = path.join(root, 'fake-codex-' + randomUUID() + '.mjs')
   await writeFile(executable, [
     '#!/usr/bin/env node',
-    "import { writeFileSync } from 'node:fs'",
+    "import { mkdirSync, writeFileSync } from 'node:fs'",
+    "import { dirname, resolve } from 'node:path'",
     'let prompt = ""',
     'for await (const chunk of process.stdin) prompt += chunk',
     'if (process.env.GPT56_ORCHESTRATOR_DISABLE !== "1") {',
@@ -57,7 +72,14 @@ async function fakeCodex(root, { completed = true, exitCode = 0, delayMs = 0 } =
     `await new Promise((resolve) => setTimeout(resolve, ${delayMs}))`,
     'const args = process.argv.slice(2)',
     'const outputIndex = args.indexOf("-o")',
-    'writeFileSync(args[outputIndex + 1], "1. Ledger items addressed and scope: test\\n2. Evidence and files changed: none\\n3. Verification result: pass\\n4. Risks and unresolved issues: none\\n5. Confidence and out-of-scope findings: high\\n")',
+    ...(writeRelative ? [
+      'const writeTarget = resolve(process.cwd(), ' + JSON.stringify(writeRelative) + ')',
+      'mkdirSync(dirname(writeTarget), { recursive: true })',
+      'writeFileSync(writeTarget, "worker change\\n")',
+    ] : []),
+    ...(reportContent === null
+      ? []
+      : ['writeFileSync(args[outputIndex + 1], ' + JSON.stringify(reportContent) + ')']),
     'process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "thread-test-123" }) + "\\n")',
     completed
       ? 'process.stdout.write(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 7, output_tokens: 5 } }) + "\\n")'
@@ -95,8 +117,8 @@ test('builds exact model, effort, fast-tier, sandbox, and no-descendant Codex ar
     outputPath: '/tmp/result.md',
     scratchPath: '/tmp/scratch',
   })
-  assert.deepEqual(args.slice(0, 8), [
-    'exec', '--ephemeral', '--ignore-user-config', '--disable', 'remote_plugin', '--json', '--color', 'never',
+  assert.deepEqual(args.slice(0, 10), [
+    'exec', '--ephemeral', '--ignore-user-config', '--disable', 'remote_plugin', '--disable', 'plugins', '--json', '--color', 'never',
   ])
   assert.equal(args[args.indexOf('-m') + 1], 'gpt-5.6-sol')
   assert.equal(args[args.indexOf('-s') + 1], 'workspace-write')
@@ -150,6 +172,7 @@ test('creates a Sol-controlled run and materializes bounded workers safely', asy
   const run = await createRun({ cwd, objective: 'Review routing', runId: 'safe-run', dataDir })
   assert.deepEqual(run.controller, {
     model: 'gpt-5.6-sol', effort: 'max', authority: 'main-session',
+    attestation: 'declared-main-session-contract',
   })
   assert.equal(run.workerBackend, 'codex-exec-background')
 
@@ -162,7 +185,7 @@ test('creates a Sol-controlled run and materializes bounded workers safely', asy
   })
   assert.equal(readWorker.status, 'queued')
   assert.equal(readWorker.model, 'gpt-5.6-terra')
-  assert.equal(readWorker.effort, 'medium')
+  assert.equal(readWorker.effort, 'max')
 
   await assert.rejects(() => materializeWorker({
     runId: run.runId,
@@ -199,6 +222,21 @@ test('creates a Sol-controlled run and materializes bounded workers safely', asy
   }), /non-symlink/i)
 })
 
+test('reclaims stale controller locks and serializes concurrent run creation', async () => {
+  const { cwd, dataDir } = await makeWorkspace()
+  const lockPath = path.join(dataDir, '.controller-lock')
+  await mkdir(lockPath)
+  const stale = new Date(Date.now() - 60_000)
+  await utimes(lockPath, stale, stale)
+  const [first, second] = await Promise.all([
+    createRun({ cwd, objective: 'First concurrent run', runId: 'lock-run-one', dataDir }),
+    createRun({ cwd, objective: 'Second concurrent run', runId: 'lock-run-two', dataDir }),
+  ])
+  assert.equal(first.runId, 'lock-run-one')
+  assert.equal(second.runId, 'lock-run-two')
+  await assert.rejects(readFile(path.join(lockPath, 'owner-token')), /ENOENT/)
+})
+
 test('runs a pinned worker and records durable runtime proof', async () => {
   const { cwd, dataDir } = await makeWorkspace()
   const taskFile = await writeTask(cwd)
@@ -220,12 +258,18 @@ test('runs a pinned worker and records durable runtime proof', async () => {
   assert.equal(proof.status, 'completed')
   assert.equal(proof.role, 'orchestrator_luna_gatherer')
   assert.equal(proof.model, 'gpt-5.6-luna')
-  assert.equal(proof.effort, 'low')
+  assert.equal(proof.effort, 'max')
   assert.equal(proof.threadId, 'thread-test-123')
   assert.equal(proof.runtimeCompleted, true)
-  assert.equal(proof.schemaVersion, 2)
+  assert.equal(proof.schemaVersion, 3)
+  assert.equal(proof.launchContract.source, 'controller-cli-request')
+  assert.equal(proof.runtimeEvidence.lifecycleValid, true)
+  assert.equal(proof.runtimeEvidence.modelObserved, false)
+  assert.equal(proof.reportContract.valid, true)
+  assert.equal(proof.ownership.valid, true)
   assert.deepEqual(proof.recursionGuard, {
     multiAgentDisabled: true,
+    pluginsDisabled: true,
     orchestratorHooksDisabled: true,
   })
   assert.equal(proof.exitCode, 0)
@@ -258,7 +302,7 @@ test('fails closed when Codex output lacks a completed runtime event', async () 
     workerId: 'gather',
     dataDir,
     env: { ...process.env, GPT56_ORCHESTRATOR_CODEX_BIN: codexBin },
-  }), /runtime proof validation/i)
+  }), /runtime, handoff, or ownership proof validation/i)
   const status = await getRunStatus({ runId: 'failed-proof', dataDir })
   assert.equal(status.successful, false)
   assert.equal(status.workers[0].status, 'failed')
@@ -293,6 +337,8 @@ test('launches a model-pinned Codex subagent in the background and can stop it',
   assert.equal(running.workers[0].status, 'running')
   const stopped = await stopWorkers({ runId: 'background-run', workerId: 'explore', dataDir })
   assert.deepEqual(stopped.stopped, ['explore'])
+  assert.deepEqual(stopped.signaled, ['explore'])
+  await new Promise((resolve) => setTimeout(resolve, 150))
   const status = await getRunStatus({ runId: 'background-run', dataDir })
   assert.equal(status.workers[0].status, 'stopped')
 })
@@ -485,7 +531,7 @@ test('validates the complete controller contract and detailed task contracts', a
   )
 })
 
-test('requires safe, disjoint ownership for active write workers and preserves read-only parallelism', async () => {
+test('serializes writers per workspace while preserving read-only parallelism', async () => {
   const { cwd, dataDir } = await makeWorkspace()
   const taskFile = await writeTask(cwd)
   await createRun({ cwd, objective: 'Ownership', runId: 'ownership-run', dataDir })
@@ -510,11 +556,10 @@ test('requires safe, disjoint ownership for active write workers and preserves r
     runId: 'ownership-run', workerId: 'writer-overlap', role: 'orchestrator_terra_worker',
     taskFile, allowWrite: true, owns: 'src', dataDir,
   }), /overlaps active worker/i)
-  const second = await materializeWorker({
+  await assert.rejects(() => materializeWorker({
     runId: 'ownership-run', workerId: 'writer-two', role: 'orchestrator_terra_worker',
     taskFile, allowWrite: true, owns: 'lib/two.js', dataDir,
-  })
-  assert.deepEqual(second.owns, ['lib/two.js'])
+  }), /workspace already has active write worker.*worktree/i)
   const reader = await materializeWorker({
     runId: 'ownership-run', workerId: 'reader', role: 'orchestrator_luna_gatherer', taskFile, dataDir,
   })
@@ -565,4 +610,202 @@ test('renders a pure dashboard and opens a right-side pane only from an attached
     'split-window', '-h', '-d', '-p', '35', '-P', '-F', '#{pane_id}',
   ])
   assert.deepEqual(tmuxCalls[2], ['select-pane', '-t', '%42', '-T', 'GPT-5.6 agents'])
+})
+
+test('enforces hard execution timeout and exact five-field reports', async () => {
+  const timeoutFixture = await makeWorkspace()
+  const timeoutTask = await writeTask(timeoutFixture.cwd)
+  await createRun({
+    cwd: timeoutFixture.cwd,
+    objective: 'Bound runtime',
+    runId: 'timeout-run',
+    dataDir: timeoutFixture.dataDir,
+  })
+  await materializeWorker({
+    runId: 'timeout-run',
+    workerId: 'slow',
+    role: 'orchestrator_luna_gatherer',
+    taskFile: timeoutTask,
+    executionTimeoutSeconds: 1,
+    dataDir: timeoutFixture.dataDir,
+  })
+  const slowCodex = await fakeCodex(timeoutFixture.dataDir, { delayMs: 5_000 })
+  await assert.rejects(() => runWorker({
+    runId: 'timeout-run',
+    workerId: 'slow',
+    dataDir: timeoutFixture.dataDir,
+    env: { ...process.env, GPT56_ORCHESTRATOR_CODEX_BIN: slowCodex },
+  }), /exceeded 1 seconds/i)
+  const timeoutStatus = await getRunStatus({ runId: 'timeout-run', dataDir: timeoutFixture.dataDir })
+  const timeoutProof = JSON.parse(await readFile(timeoutStatus.workers[0].proofPath, 'utf8'))
+  assert.equal(timeoutProof.terminationReason, 'execution-timeout')
+  assert.equal(timeoutProof.status, 'failed')
+
+  const reportFixture = await makeWorkspace()
+  const reportTask = await writeTask(reportFixture.cwd)
+  await createRun({
+    cwd: reportFixture.cwd,
+    objective: 'Validate report',
+    runId: 'report-run',
+    dataDir: reportFixture.dataDir,
+  })
+  await materializeWorker({
+    runId: 'report-run', workerId: 'weak', role: 'orchestrator_luna_gatherer',
+    taskFile: reportTask, dataDir: reportFixture.dataDir,
+  })
+  const weakCodex = await fakeCodex(reportFixture.dataDir, {
+    reportContent: 'Verification result: pass\n',
+  })
+  await assert.rejects(() => runWorker({
+    runId: 'report-run', workerId: 'weak', dataDir: reportFixture.dataDir,
+    env: { ...process.env, GPT56_ORCHESTRATOR_CODEX_BIN: weakCodex },
+  }), /handoff/i)
+  const reportStatus = await getRunStatus({ runId: 'report-run', dataDir: reportFixture.dataDir })
+  const reportProof = JSON.parse(await readFile(reportStatus.workers[0].proofPath, 'utf8'))
+  assert.equal(reportProof.reportContract.valid, false)
+})
+
+test('accepts owned Git-visible writes and rejects ownership escape', async () => {
+  const allowed = await makeWorkspace()
+  const allowedTask = await writeTask(allowed.cwd)
+  await createRun({ cwd: allowed.cwd, objective: 'Owned write', runId: 'owned-run', dataDir: allowed.dataDir })
+  await materializeWorker({
+    runId: 'owned-run', workerId: 'writer', role: 'orchestrator_luna_worker',
+    taskFile: allowedTask, allowWrite: true, owns: 'src/owned.js', dataDir: allowed.dataDir,
+  })
+  const allowedCodex = await fakeCodex(allowed.dataDir, { writeRelative: 'src/owned.js' })
+  const allowedProof = await runWorker({
+    runId: 'owned-run', workerId: 'writer', dataDir: allowed.dataDir,
+    env: { ...process.env, GPT56_ORCHESTRATOR_CODEX_BIN: allowedCodex },
+  })
+  assert.equal(allowedProof.ownership.valid, true)
+  assert.deepEqual(allowedProof.ownership.changedPaths, ['src/owned.js'])
+
+  const escaped = await makeWorkspace()
+  const escapedTask = await writeTask(escaped.cwd)
+  await createRun({ cwd: escaped.cwd, objective: 'Escape write', runId: 'escape-run', dataDir: escaped.dataDir })
+  await materializeWorker({
+    runId: 'escape-run', workerId: 'writer', role: 'orchestrator_luna_worker',
+    taskFile: escapedTask, allowWrite: true, owns: 'src/owned.js', dataDir: escaped.dataDir,
+  })
+  const escapedCodex = await fakeCodex(escaped.dataDir, { writeRelative: 'outside.js' })
+  await assert.rejects(() => runWorker({
+    runId: 'escape-run', workerId: 'writer', dataDir: escaped.dataDir,
+    env: { ...process.env, GPT56_ORCHESTRATOR_CODEX_BIN: escapedCodex },
+  }), /ownership proof validation/i)
+  const escapedStatus = await getRunStatus({ runId: 'escape-run', dataDir: escaped.dataDir })
+  const escapedProof = JSON.parse(await readFile(escapedStatus.workers[0].proofPath, 'utf8'))
+  assert.deepEqual(escapedProof.ownership.outsidePaths, ['outside.js'])
+})
+
+test('enforces writer serialization across runs sharing one workspace', async () => {
+  const { cwd, dataDir } = await makeWorkspace()
+  const taskFile = await writeTask(cwd)
+  await createRun({ cwd, objective: 'First writer', runId: 'writer-run-one', dataDir })
+  await createRun({ cwd, objective: 'Second writer', runId: 'writer-run-two', dataDir })
+  await materializeWorker({
+    runId: 'writer-run-one', workerId: 'first', role: 'orchestrator_luna_worker',
+    taskFile, allowWrite: true, owns: 'src/one.js', dataDir,
+  })
+  await assert.rejects(() => materializeWorker({
+    runId: 'writer-run-two', workerId: 'second', role: 'orchestrator_terra_worker',
+    taskFile, allowWrite: true, owns: 'lib/two.js', dataDir,
+  }), /workspace already has active write worker.*worktree/i)
+})
+
+test('serializes writers opened from different subdirectories of one Git worktree', async () => {
+  const { cwd, dataDir } = await makeWorkspace()
+  const firstCwd = path.join(cwd, 'packages', 'one')
+  const secondCwd = path.join(cwd, 'packages', 'two')
+  await mkdir(path.join(firstCwd, '.workflow', 'tasks'), { recursive: true })
+  await mkdir(path.join(secondCwd, '.workflow', 'tasks'), { recursive: true })
+  const firstTask = await writeTask(firstCwd)
+  const secondTask = await writeTask(secondCwd)
+  await createRun({ cwd: firstCwd, objective: 'First nested writer', runId: 'nested-writer-one', dataDir })
+  await createRun({ cwd: secondCwd, objective: 'Second nested writer', runId: 'nested-writer-two', dataDir })
+  await materializeWorker({
+    runId: 'nested-writer-one', workerId: 'first', role: 'orchestrator_luna_worker',
+    taskFile: firstTask, allowWrite: true, owns: 'src/one.js', dataDir,
+  })
+  await assert.rejects(() => materializeWorker({
+    runId: 'nested-writer-two', workerId: 'second', role: 'orchestrator_terra_worker',
+    taskFile: secondTask, allowWrite: true, owns: 'lib/two.js', dataDir,
+  }), /workspace already has active write worker.*worktree/i)
+})
+
+test('reconciles abandoned queued workers and auto-exits completed dashboards', async () => {
+  const stale = await makeWorkspace()
+  const staleTask = await writeTask(stale.cwd)
+  await createRun({ cwd: stale.cwd, objective: 'Stale worker', runId: 'stale-run', dataDir: stale.dataDir })
+  await materializeWorker({
+    runId: 'stale-run', workerId: 'abandoned', role: 'orchestrator_luna_gatherer',
+    taskFile: staleTask, dataDir: stale.dataDir,
+  })
+  const staleRecordPath = path.join(stale.dataDir, 'runs', 'stale-run', 'workers', 'abandoned', 'worker.json')
+  const staleRecord = JSON.parse(await readFile(staleRecordPath, 'utf8'))
+  staleRecord.updatedAt = '2020-01-01T00:00:00.000Z'
+  await writeFile(staleRecordPath, JSON.stringify(staleRecord))
+  const staleStatus = await getRunStatus({ runId: 'stale-run', dataDir: stale.dataDir })
+  assert.equal(staleStatus.workers[0].status, 'failed')
+  assert.match(staleStatus.workers[0].error, /launcher is no longer running/i)
+
+  const complete = await makeWorkspace()
+  const completeTask = await writeTask(complete.cwd)
+  await createRun({ cwd: complete.cwd, objective: 'Dashboard complete', runId: 'dashboard-complete', dataDir: complete.dataDir })
+  await materializeWorker({
+    runId: 'dashboard-complete', workerId: 'done', role: 'orchestrator_luna_gatherer',
+    taskFile: completeTask, dataDir: complete.dataDir,
+  })
+  const codexBin = await fakeCodex(complete.dataDir)
+  await runWorker({
+    runId: 'dashboard-complete', workerId: 'done', dataDir: complete.dataDir,
+    env: { ...process.env, GPT56_ORCHESTRATOR_CODEX_BIN: codexBin },
+  })
+  const writes = []
+  const dashboardStatus = await runDashboard({
+    runId: 'dashboard-complete', watch: true, intervalMs: 10, dataDir: complete.dataDir,
+    write: (value) => writes.push(value),
+  })
+  assert.equal(dashboardStatus.complete, true)
+  assert.match(writes.join(''), /turn completed/i)
+})
+
+test('prune is dry-run first and moves only old terminal runs to recoverable trash', async () => {
+  const { cwd, dataDir } = await makeWorkspace()
+  await createRun({ cwd, objective: 'Old empty run', runId: 'old-run', dataDir })
+  const oldManifestPath = path.join(dataDir, 'runs', 'old-run', 'run.json')
+  const oldManifest = JSON.parse(await readFile(oldManifestPath, 'utf8'))
+  oldManifest.createdAt = '2020-01-01T00:00:00.000Z'
+  await writeFile(oldManifestPath, JSON.stringify(oldManifest))
+
+  await createRun({ cwd, objective: 'Active run', runId: 'active-run', dataDir })
+  const taskFile = await writeTask(cwd)
+  await materializeWorker({
+    runId: 'active-run', workerId: 'active', role: 'orchestrator_luna_gatherer',
+    taskFile, dataDir,
+  })
+  const preview = await pruneRuns({ olderThanHours: 24, dataDir, now: Date.parse('2026-07-20T00:00:00Z') })
+  assert.deepEqual(preview.candidates, ['old-run'])
+  assert.deepEqual(preview.skippedActive, ['active-run'])
+  assert.equal(preview.moved.length, 0)
+  assert.ok(await readFile(oldManifestPath, 'utf8'))
+
+  const applied = await pruneRuns({
+    olderThanHours: 24, apply: true, dataDir, now: Date.parse('2026-07-20T00:00:00Z'),
+  })
+  assert.equal(applied.moved.length, 1)
+  await assert.rejects(() => readFile(oldManifestPath, 'utf8'), /ENOENT/)
+  assert.ok(await readFile(path.join(applied.moved[0].destination, 'run.json'), 'utf8'))
+  assert.ok(await readFile(path.join(dataDir, 'runs', 'active-run', 'run.json'), 'utf8'))
+})
+
+test('CLI exposes the canonical data root and new lifecycle controls', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'g56o-cli-data-'))
+  const result = await runCli(['data-dir'], { GPT56_ORCHESTRATOR_DATA_DIR: dataDir })
+  assert.equal(result.code, 0)
+  assert.equal(JSON.parse(result.stdout).dataDir, dataDir)
+  const help = await runCli(['help'])
+  assert.match(help.stdout, /execution-timeout-seconds/)
+  assert.match(help.stdout, /prune --older-than-hours/)
+  assert.match(help.stdout, /data-dir/)
 })

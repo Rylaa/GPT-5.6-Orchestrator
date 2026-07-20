@@ -12,10 +12,10 @@ import {
 
 test('maps dynamic worker roles to exact models, efforts, and sandboxes', () => {
   const expected = {
-    orchestrator_luna_gatherer: ['gpt-5.6-luna', 'low', 'read-only'],
-    orchestrator_luna_worker: ['gpt-5.6-luna', 'medium', 'workspace-write'],
-    orchestrator_terra_explorer: ['gpt-5.6-terra', 'medium', 'read-only'],
-    orchestrator_terra_worker: ['gpt-5.6-terra', 'high', 'workspace-write'],
+    orchestrator_luna_gatherer: ['gpt-5.6-luna', 'max', 'read-only'],
+    orchestrator_luna_worker: ['gpt-5.6-luna', 'max', 'workspace-write'],
+    orchestrator_terra_explorer: ['gpt-5.6-terra', 'max', 'read-only'],
+    orchestrator_terra_worker: ['gpt-5.6-terra', 'max', 'workspace-write'],
     orchestrator_sol_specialist: ['gpt-5.6-sol', 'max', 'workspace-write'],
   }
   assert.deepEqual(MANAGED_AGENT_TYPES, Object.keys(expected))
@@ -43,14 +43,14 @@ test('does not promote generic or attacker-controlled role names', () => {
 })
 
 test('allows only model-effort pairs represented by worker roles', () => {
-  assert.equal(isManagedModelEffort({ model: 'gpt-5.6-luna', effort: 'medium' }), true)
+  assert.equal(isManagedModelEffort({ model: 'gpt-5.6-luna', effort: 'max' }), true)
   assert.equal(isManagedModelEffort({ model: ' GPT-5.6-SOL ', effort: ' MAX ' }), true)
-  assert.equal(isManagedModelEffort({ model: 'gpt-5.6-luna', effort: 'max' }), false)
+  assert.equal(isManagedModelEffort({ model: 'gpt-5.6-luna', effort: 'medium' }), false)
   assert.equal(isManagedModelEffort({ model: 'gpt-5.6-sol' }), false)
   assert.equal(isManagedModelEffort(), false)
   assert.deepEqual(
-    resolveManagedModelEffort({ model: 'GPT-5.6-TERRA', effort: 'HIGH' }),
-    { model: 'gpt-5.6-terra', effort: 'high' },
+    resolveManagedModelEffort({ model: 'GPT-5.6-TERRA', effort: 'MAX' }),
+    { model: 'gpt-5.6-terra', effort: 'max' },
   )
   assert.equal(resolveManagedModelEffort({ model: 'gpt-5.6-terra' }), null)
 })

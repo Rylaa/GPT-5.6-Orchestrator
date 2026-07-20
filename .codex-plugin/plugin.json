@@ -1,7 +1,7 @@
 {
   "name": "codex-sol-fusion",
-  "version": "0.1.0+codex.20260720104955",
-  "description": "Sol Max directs dynamic, task-shaped Luna, Terra, and Sol Codex subagents.",
+  "version": "0.2.0+codex.20260720134539",
+  "description": "Sol Max directs task-shaped Luna, Terra, and Sol Codex subagents at max effort.",
   "author": {
     "name": "Yusuf"
   },
@@ -9,8 +9,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "GPT-5.6 Orchestrator",
-    "shortDescription": "Sol Max directs dynamic task-shaped workers.",
-    "longDescription": "Keeps GPT-5.6 Sol at max in the main session as planner, subagent controller, consequential decision maker, and final authority while dynamically routing bounded work to pinned Luna, Terra, or Sol Codex subagents.",
+    "shortDescription": "Sol Max directs task-shaped max-effort workers.",
+    "longDescription": "Keeps GPT-5.6 Sol at max in the main session as planner, subagent controller, consequential decision maker, and final authority while dynamically routing bounded work to pinned max-effort Luna, Terra, or Sol Codex subagents.",
     "developerName": "Yusuf",
     "category": "Productivity",
     "capabilities": [
@@ -20,7 +20,7 @@
     ],
     "defaultPrompt": [
       "Keep GPT-5.6 Sol at max in the main session and decompose every request into task-shaped lanes before acting.",
-      "Have main-session Sol clarify material ambiguity, decide, dynamically launch and control pinned Luna, Terra, or Sol Codex subagents, and retain every consequential decision and final acceptance.",
+      "Have main-session Sol clarify material ambiguity, decide, dynamically launch and control max-effort Luna, Terra, or Sol Codex subagents, and retain every consequential decision and final acceptance.",
       "Have write workers run focused tests inside their bounded lane, then return evidence directly to main-session Sol for inspection and final acceptance."
     ]
   }

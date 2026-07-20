@@ -21,7 +21,7 @@ async function read(relativePath) {
 test('manifest exposes GPT-5.6 Orchestrator while preserving legacy install identity', async () => {
   const manifest = JSON.parse(await read('.codex-plugin/plugin.json'))
   assert.equal(manifest.name, 'codex-sol-fusion')
-  assert.match(manifest.version, /^0\.1\.0(?:\+codex\.\d{14})?$/)
+  assert.match(manifest.version, /^0\.2\.0(?:\+codex\.\d{14})?$/)
   assert.equal(manifest.skills, './skills/')
   assert.equal(manifest.interface.displayName, 'GPT-5.6 Orchestrator')
   assert.deepEqual(manifest.interface.capabilities, ['Interactive', 'Read', 'Write'])
@@ -122,15 +122,15 @@ test('worker profiles match task-shaped pins and return authority to main Sol', 
     assert.match(profile, /nickname_candidates\s*=\s*\[/)
     assert.match(profile, /\[agents\]\nmax_depth = 1/)
     assert.doesNotMatch(profile, /service_tier =/)
+    assert.match(profile, /model_reasoning_effort = "max"/)
     if (filename.startsWith('orchestrator-sol-')) {
       assert.match(profile, /model = "gpt-5\.6-sol"/)
       assert.match(profile, /model_reasoning_effort = "max"/)
     }
   }
-  assert.match(contents['orchestrator-luna-gatherer.toml'], /model_reasoning_effort = "low"/)
-  assert.match(contents['orchestrator-luna-worker.toml'], /model_reasoning_effort = "medium"/)
-  assert.match(contents['orchestrator-terra-explorer.toml'], /model_reasoning_effort = "medium"/)
-  assert.match(contents['orchestrator-terra-worker.toml'], /model_reasoning_effort = "high"/)
+  for (const profile of Object.values(contents)) {
+    assert.match(profile, /model_reasoning_effort = "max"/)
+  }
   assert.match(contents['orchestrator-sol-specialist.toml'], /sandbox_mode = "workspace-write"/)
   const nicknames = profiles.flatMap((filename) => {
     const match = contents[filename].match(/nickname_candidates\s*=\s*\[([^\]]+)\]/)
@@ -169,8 +169,11 @@ test('README is concise and shows Sol controlling dynamic Codex subagents', asyn
   assert.match(readme, /private `report\.md`.*private `scratch\/`/i)
   assert.match(readme, /runtime proof alone is not semantic success/i)
   assert.match(readme, /--owns/)
-  assert.match(readme, /overlap.*active write worker/i)
-  assert.match(readme, /proof\.json.*schema v2/i)
+  assert.match(readme, /one writer may run.*Git workspace/i)
+  assert.match(readme, /proof\.json.*schema v3/i)
+  assert.match(readme, /Schema-v2 proofs remain readable/i)
+  assert.match(readme, /hard timeout/i)
+  assert.match(readme, /recoverable.*trash/i)
   assert.match(readme, /native multi-agent spawning disabled.*Orchestrator hooks disabled/i)
   assert.match(readme, /at most three verify\/fix cycles/i)
   assert.match(readme, /legacy package ID remains.*codex-sol-fusion/i)

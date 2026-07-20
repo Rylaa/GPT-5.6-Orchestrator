@@ -60,6 +60,7 @@ test('installs task-shaped Luna, Terra, and Sol worker profiles without a worker
     assert.match(profile, /\[agents\]\nmax_depth = 1/)
     assert.match(profile, /do not spawn agents/i)
     assert.doesNotMatch(profile, /service_tier =/)
+    assert.match(profile, /model_reasoning_effort = "max"/)
     if (filename.startsWith('orchestrator-sol-')) {
       assert.match(profile, /model = "gpt-5\.6-sol"/)
       assert.match(profile, /model_reasoning_effort = "max"/)

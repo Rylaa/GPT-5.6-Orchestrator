@@ -21,7 +21,7 @@ If the active main session is not GPT-5.6 Sol at `max`, do not pretend it is the
 
 The active direct collaboration schema cannot select a named profile, model, or reasoning effort, and its alternate Sol-root schema is rejected by the backend. For current exact routing, use only the bundled `scripts/orchestrator.mjs` controller. It starts independently logged background `codex exec` subagents. Do not start ad hoc nested Codex processes and do not use a generic native child for a named lane. Prefer native Codex subagents if a future active schema can prove the exact requested model and effort.
 
-The main Sol session remains the scheduler. The bundled controller performs only Sol's explicit `create`, `spawn`, `status`, `wait`, and `stop` commands; it never decides which worker to use or what result to accept.
+The main Sol session remains the scheduler. The bundled controller performs only Sol's explicit lifecycle, visibility, and retention commands; it never decides which worker to use or what result to accept.
 
 Native Codex subagents are visible as Desktop threads, through CLI `/agent`, or in the IDE background-agent panel. They are not substitutes for these named lanes until the active tool schema proves the exact role, model, and effort pins.
 
@@ -31,24 +31,30 @@ Resolve `<plugin-root>` from this installed skill's location, then use the bundl
 
 ```sh
 node <plugin-root>/scripts/orchestrator.mjs create --cwd "$PWD" --objective "<bounded objective>"
-node <plugin-root>/scripts/orchestrator.mjs spawn --run <run-id> --worker <id> --role <role> --task-file <repo-local-task-file>
+node <plugin-root>/scripts/orchestrator.mjs spawn --run <run-id> --worker <id> --role <role> --task-file <repo-local-task-file> --execution-timeout-seconds 1800
 node <plugin-root>/scripts/orchestrator.mjs status --run <run-id> --json
 node <plugin-root>/scripts/orchestrator.mjs dashboard --run <run-id> --watch --interval-ms 1000
 node <plugin-root>/scripts/orchestrator.mjs pane --run <run-id> --width 40 --interval-ms 1000
 node <plugin-root>/scripts/orchestrator.mjs wait --run <run-id> --worker <id> --timeout-seconds 30 --json
 node <plugin-root>/scripts/orchestrator.mjs stop --run <run-id> --worker <id>
+node <plugin-root>/scripts/orchestrator.mjs data-dir
+node <plugin-root>/scripts/orchestrator.mjs prune --older-than-hours 168
 ```
 
-`dashboard` is a terminal status view. `pane` opens an optional right-side tmux view and works only when Codex CLI is already inside tmux; it observes exact-pinned external workers, not a native Codex sidebar. tmux is optional. Task files must be regular non-symlink files inside the target working directory. Add `--allow-write --owns <path[,path]>` only after Sol has bounded a write worker's files and acceptance criteria; unsafe paths and overlap with an active writer are rejected. The controller caps a run at eight active workers. Every completed worker must have a non-empty `threadId`, a completed runtime event, and proof schema v2 whose role, model, effort, sandbox, service tier, and recursion-guard configuration match the requested lane. Read the private report and proof; never treat process launch success as task success.
+An installed controller derives the same plugin-managed data root that Codex passes to plugin hooks. `GPT56_ORCHESTRATOR_DATA_DIR` is the explicit standalone/test override. `dashboard` shows status, elapsed time, and bounded activity metadata for exact-pinned external workers; watched dashboards exit when all workers are terminal unless `--keep-open` is supplied. `pane` opens that dashboard in an optional right-side tmux view and works only when Codex CLI is already inside tmux; it is not a native Codex sidebar.
+
+Task files must be regular non-symlink files inside the target working directory. Add `--allow-write --owns <path[,path]>` only after Sol has bounded a write worker's files and acceptance criteria. A write worker requires a Git worktree, only one writer may be active per workspace across runs, and parallel writers use separate worktrees. Post-run Git-visible and workflow-contract snapshots reject successful proof when changes escape ownership; this is detection, not filesystem confinement. The controller caps all active workers across runs at eight. Worker execution has a hard timeout, and Stop signals only a process with a fresh token-matching heartbeat. `prune` is dry-run unless `--apply` is supplied, and applied pruning moves only old terminal runs into recoverable plugin trash.
+
+New workers emit proof schema v3. It separates the requested model/effort/sandbox/tier launch contract from the runtime-observed Codex thread and completed-turn events, because current event JSON does not attest model or effort. Completion also requires a valid exact five-field report and ownership evidence. Schema-v2 proofs remain readable. Read the private report and proof; never treat process launch success as task success.
 
 ## Roles
 
 | Role | Model and effort | Access | Use |
 |---|---|---|---|
-| `orchestrator_luna_gatherer` | Luna, low | read-only | Known-source extraction, classification, structured summaries |
-| `orchestrator_luna_worker` | Luna, medium | workspace-write | Exact repeatable edits and focused tests |
-| `orchestrator_terra_explorer` | Terra, medium | read-only | Broad repository scans, large files, research synthesis |
-| `orchestrator_terra_worker` | Terra, high | workspace-write | Everyday implementation, integration, root-cause fixes |
+| `orchestrator_luna_gatherer` | Luna, max | read-only | Known-source extraction, classification, structured summaries |
+| `orchestrator_luna_worker` | Luna, max | workspace-write | Exact repeatable edits and focused tests |
+| `orchestrator_terra_explorer` | Terra, max | read-only | Broad repository scans, large files, research synthesis |
+| `orchestrator_terra_worker` | Terra, max | workspace-write | Everyday implementation, integration, root-cause fixes |
 | `orchestrator_sol_specialist` | Sol, max | workspace-write | Critical, deeply coupled, novel, ambiguity-heavy implementation |
 
 There is no worker judge or separate QA stage. The Sol Max main session is the judge. An additional Sol process may be a bounded specialist, but it cannot take over orchestration or final acceptance.
@@ -62,6 +68,8 @@ Classify each lane by ambiguity, breadth, repeatability, write scope, dependency
 3. Give Terra broad read-heavy exploration and everyday work that needs real judgment, integration, or root-cause analysis.
 4. Give the most critical, deeply coupled, novel, or ambiguity-heavy implementation to `orchestrator_sol_specialist` after the main Sol session decides the direction.
 5. Do not silently substitute models or efforts. If a required pin is unavailable, mark that lane unverified.
+
+Every delegated role uses reasoning effort `max`. Task shape selects the model tier; lowering effort is not the cost-control mechanism.
 
 Prompt length controls ledger policy, not model routing.
 
@@ -90,7 +98,7 @@ Decompose every request into task-shaped lanes before acting, even when efficien
 - Batch related evidence into bounded worker tasks and reuse one run rather than creating many runs.
 - Prefer Luna for mechanical speed, Terra for broad/context-heavy work, and additional Sol only for frontier reasoning or high-risk verification.
 - Poll with short `status` or bounded `wait` calls; keep the main session responsive.
-- Every worker runs on service tier `fast`, has lean isolated context, writes durable artifacts, and cannot spawn descendants. The fallback controller ignores unrelated user config, disables the remote plugin catalog so unused skill descriptions do not consume the worker context budget, forces `GPT56_ORCHESTRATOR_DISABLE=1` in worker runtimes to prevent recursive orchestration, and passes every required model, effort, sandbox, and tier setting explicitly.
+- Every worker runs at `max` on service tier `fast`, has lean isolated context, writes durable artifacts, and cannot spawn descendants. The fallback controller ignores unrelated user config, disables plugin discovery and the remote plugin catalog so unused plugin skills and hooks do not enter worker context, forces `GPT56_ORCHESTRATOR_DISABLE=1` as defense in depth, and passes every required model, effort, sandbox, and tier setting explicitly.
 - The main Sol session may open new workers as the task evolves, using a lead-session plus dynamic-worker pattern.
 
 Hooks and process controls are workflow guardrails, not a security boundary. The live sandbox and permission policy remain authoritative.
