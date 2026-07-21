@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${PLUGIN_ROOT}/hooks/orchestrator-hook.mjs\" session-start",
+            "command": "node --input-type=module -e \"import{lstatSync as l,readdirSync as d,readFileSync as f,statSync as s}from'node:fs';import{basename as b,dirname as p,join as j}from'node:path';import{pathToFileURL as u}from'node:url';try{const n='gpt-5-6-orchestrator',a=process.argv[1],v=r=>{try{const c=l(r),g=l(j(r,'.codex-plugin')),k=l(j(r,'hooks')),m=j(r,'.codex-plugin','plugin.json'),h=j(r,'hooks','orchestrator-hook.mjs'),x=l(m),y=l(h);if(!c.isDirectory()||c.isSymbolicLink()||!g.isDirectory()||g.isSymbolicLink()||!k.isDirectory()||k.isSymbolicLink()||!x.isFile()||x.isSymbolicLink()||x.size>65536||!y.isFile()||y.isSymbolicLink()||y.size>1048576)return false;const o=JSON.parse(f(m,'utf8'));return o.name===n&&(b(p(r))!==n||o.version===b(r))}catch{return false}};let r=v(a)?a:undefined,w=typeof a==='string'?p(a):'';if(!r&&b(w)===n)r=d(w,{withFileTypes:true}).filter(e=>e.isDirectory()).map(e=>j(w,e.name)).filter(v).sort((e,t)=>s(t).mtimeMs-s(e).mtimeMs)[0];if(r)await import(u(j(r,'hooks','orchestrator-hook.mjs')).href)}catch{}\" \"${PLUGIN_ROOT}\" session-start",
             "timeout": 10,
             "statusMessage": "Loading GPT-5.6 orchestration policy"
           }
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${PLUGIN_ROOT}/hooks/orchestrator-hook.mjs\" post-compact",
+            "command": "node --input-type=module -e \"import{lstatSync as l,readdirSync as d,readFileSync as f,statSync as s}from'node:fs';import{basename as b,dirname as p,join as j}from'node:path';import{pathToFileURL as u}from'node:url';try{const n='gpt-5-6-orchestrator',a=process.argv[1],v=r=>{try{const c=l(r),g=l(j(r,'.codex-plugin')),k=l(j(r,'hooks')),m=j(r,'.codex-plugin','plugin.json'),h=j(r,'hooks','orchestrator-hook.mjs'),x=l(m),y=l(h);if(!c.isDirectory()||c.isSymbolicLink()||!g.isDirectory()||g.isSymbolicLink()||!k.isDirectory()||k.isSymbolicLink()||!x.isFile()||x.isSymbolicLink()||x.size>65536||!y.isFile()||y.isSymbolicLink()||y.size>1048576)return false;const o=JSON.parse(f(m,'utf8'));return o.name===n&&(b(p(r))!==n||o.version===b(r))}catch{return false}};let r=v(a)?a:undefined,w=typeof a==='string'?p(a):'';if(!r&&b(w)===n)r=d(w,{withFileTypes:true}).filter(e=>e.isDirectory()).map(e=>j(w,e.name)).filter(v).sort((e,t)=>s(t).mtimeMs-s(e).mtimeMs)[0];if(r)await import(u(j(r,'hooks','orchestrator-hook.mjs')).href)}catch{}\" \"${PLUGIN_ROOT}\" post-compact",
             "timeout": 10,
             "statusMessage": "Restoring GPT-5.6 orchestration policy"
           }
@@ -31,7 +31,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${PLUGIN_ROOT}/hooks/orchestrator-hook.mjs\" user-prompt-submit",
+            "command": "node --input-type=module -e \"import{lstatSync as l,readdirSync as d,readFileSync as f,statSync as s}from'node:fs';import{basename as b,dirname as p,join as j}from'node:path';import{pathToFileURL as u}from'node:url';try{const n='gpt-5-6-orchestrator',a=process.argv[1],v=r=>{try{const c=l(r),g=l(j(r,'.codex-plugin')),k=l(j(r,'hooks')),m=j(r,'.codex-plugin','plugin.json'),h=j(r,'hooks','orchestrator-hook.mjs'),x=l(m),y=l(h);if(!c.isDirectory()||c.isSymbolicLink()||!g.isDirectory()||g.isSymbolicLink()||!k.isDirectory()||k.isSymbolicLink()||!x.isFile()||x.isSymbolicLink()||x.size>65536||!y.isFile()||y.isSymbolicLink()||y.size>1048576)return false;const o=JSON.parse(f(m,'utf8'));return o.name===n&&(b(p(r))!==n||o.version===b(r))}catch{return false}};let r=v(a)?a:undefined,w=typeof a==='string'?p(a):'';if(!r&&b(w)===n)r=d(w,{withFileTypes:true}).filter(e=>e.isDirectory()).map(e=>j(w,e.name)).filter(v).sort((e,t)=>s(t).mtimeMs-s(e).mtimeMs)[0];if(r)await import(u(j(r,'hooks','orchestrator-hook.mjs')).href)}catch{}\" \"${PLUGIN_ROOT}\" user-prompt-submit",
             "timeout": 10
           }
         ]
@@ -43,7 +43,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${PLUGIN_ROOT}/hooks/orchestrator-hook.mjs\" pre-tool-use",
+            "command": "node --input-type=module -e \"import{lstatSync as l,readdirSync as d,readFileSync as f,statSync as s}from'node:fs';import{basename as b,dirname as p,join as j}from'node:path';import{pathToFileURL as u}from'node:url';try{const n='gpt-5-6-orchestrator',a=process.argv[1],v=r=>{try{const c=l(r),g=l(j(r,'.codex-plugin')),k=l(j(r,'hooks')),m=j(r,'.codex-plugin','plugin.json'),h=j(r,'hooks','orchestrator-hook.mjs'),x=l(m),y=l(h);if(!c.isDirectory()||c.isSymbolicLink()||!g.isDirectory()||g.isSymbolicLink()||!k.isDirectory()||k.isSymbolicLink()||!x.isFile()||x.isSymbolicLink()||x.size>65536||!y.isFile()||y.isSymbolicLink()||y.size>1048576)return false;const o=JSON.parse(f(m,'utf8'));return o.name===n&&(b(p(r))!==n||o.version===b(r))}catch{return false}};let r=v(a)?a:undefined,w=typeof a==='string'?p(a):'';if(!r&&b(w)===n)r=d(w,{withFileTypes:true}).filter(e=>e.isDirectory()).map(e=>j(w,e.name)).filter(v).sort((e,t)=>s(t).mtimeMs-s(e).mtimeMs)[0];if(r)await import(u(j(r,'hooks','orchestrator-hook.mjs')).href)}catch{}\" \"${PLUGIN_ROOT}\" pre-tool-use",
             "timeout": 10
           }
         ]
@@ -54,7 +54,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${PLUGIN_ROOT}/hooks/orchestrator-hook.mjs\" subagent-start",
+            "command": "node --input-type=module -e \"import{lstatSync as l,readdirSync as d,readFileSync as f,statSync as s}from'node:fs';import{basename as b,dirname as p,join as j}from'node:path';import{pathToFileURL as u}from'node:url';try{const n='gpt-5-6-orchestrator',a=process.argv[1],v=r=>{try{const c=l(r),g=l(j(r,'.codex-plugin')),k=l(j(r,'hooks')),m=j(r,'.codex-plugin','plugin.json'),h=j(r,'hooks','orchestrator-hook.mjs'),x=l(m),y=l(h);if(!c.isDirectory()||c.isSymbolicLink()||!g.isDirectory()||g.isSymbolicLink()||!k.isDirectory()||k.isSymbolicLink()||!x.isFile()||x.isSymbolicLink()||x.size>65536||!y.isFile()||y.isSymbolicLink()||y.size>1048576)return false;const o=JSON.parse(f(m,'utf8'));return o.name===n&&(b(p(r))!==n||o.version===b(r))}catch{return false}};let r=v(a)?a:undefined,w=typeof a==='string'?p(a):'';if(!r&&b(w)===n)r=d(w,{withFileTypes:true}).filter(e=>e.isDirectory()).map(e=>j(w,e.name)).filter(v).sort((e,t)=>s(t).mtimeMs-s(e).mtimeMs)[0];if(r)await import(u(j(r,'hooks','orchestrator-hook.mjs')).href)}catch{}\" \"${PLUGIN_ROOT}\" subagent-start",
             "timeout": 10
           }
         ]
@@ -65,7 +65,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${PLUGIN_ROOT}/hooks/orchestrator-hook.mjs\" subagent-stop",
+            "command": "node --input-type=module -e \"import{lstatSync as l,readdirSync as d,readFileSync as f,statSync as s}from'node:fs';import{basename as b,dirname as p,join as j}from'node:path';import{pathToFileURL as u}from'node:url';try{const n='gpt-5-6-orchestrator',a=process.argv[1],v=r=>{try{const c=l(r),g=l(j(r,'.codex-plugin')),k=l(j(r,'hooks')),m=j(r,'.codex-plugin','plugin.json'),h=j(r,'hooks','orchestrator-hook.mjs'),x=l(m),y=l(h);if(!c.isDirectory()||c.isSymbolicLink()||!g.isDirectory()||g.isSymbolicLink()||!k.isDirectory()||k.isSymbolicLink()||!x.isFile()||x.isSymbolicLink()||x.size>65536||!y.isFile()||y.isSymbolicLink()||y.size>1048576)return false;const o=JSON.parse(f(m,'utf8'));return o.name===n&&(b(p(r))!==n||o.version===b(r))}catch{return false}};let r=v(a)?a:undefined,w=typeof a==='string'?p(a):'';if(!r&&b(w)===n)r=d(w,{withFileTypes:true}).filter(e=>e.isDirectory()).map(e=>j(w,e.name)).filter(v).sort((e,t)=>s(t).mtimeMs-s(e).mtimeMs)[0];if(r)await import(u(j(r,'hooks','orchestrator-hook.mjs')).href)}catch{}\" \"${PLUGIN_ROOT}\" subagent-stop",
             "timeout": 10
           }
         ]
@@ -76,7 +76,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${PLUGIN_ROOT}/hooks/orchestrator-hook.mjs\" stop",
+            "command": "node --input-type=module -e \"import{lstatSync as l,readdirSync as d,readFileSync as f,statSync as s}from'node:fs';import{basename as b,dirname as p,join as j}from'node:path';import{pathToFileURL as u}from'node:url';try{const n='gpt-5-6-orchestrator',a=process.argv[1],v=r=>{try{const c=l(r),g=l(j(r,'.codex-plugin')),k=l(j(r,'hooks')),m=j(r,'.codex-plugin','plugin.json'),h=j(r,'hooks','orchestrator-hook.mjs'),x=l(m),y=l(h);if(!c.isDirectory()||c.isSymbolicLink()||!g.isDirectory()||g.isSymbolicLink()||!k.isDirectory()||k.isSymbolicLink()||!x.isFile()||x.isSymbolicLink()||x.size>65536||!y.isFile()||y.isSymbolicLink()||y.size>1048576)return false;const o=JSON.parse(f(m,'utf8'));return o.name===n&&(b(p(r))!==n||o.version===b(r))}catch{return false}};let r=v(a)?a:undefined,w=typeof a==='string'?p(a):'';if(!r&&b(w)===n)r=d(w,{withFileTypes:true}).filter(e=>e.isDirectory()).map(e=>j(w,e.name)).filter(v).sort((e,t)=>s(t).mtimeMs-s(e).mtimeMs)[0];if(r)await import(u(j(r,'hooks','orchestrator-hook.mjs')).href)}catch{}\" \"${PLUGIN_ROOT}\" stop",
             "timeout": 10
           }
         ]

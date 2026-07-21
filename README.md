@@ -44,6 +44,10 @@ codex -m gpt-5.6-sol -c 'model_reasoning_effort="high"' -c 'service_tier="fast"'
 
 Trust the bundled hooks after inspecting `/hooks`; start a fresh Sol session after trust. Automatic activation applies to main-session prompts. Set `GPT56_ORCHESTRATOR_AUTO=0` to opt out, or use `$gpt-5-6-orchestrator <your task>` for one explicit session. `GPT56_ORCHESTRATOR_DISABLE=1` disables plugin hooks.
 
+Hook launchers validate the session-captured plugin root. If a later upgrade has
+pruned that version, they use only the newest valid installed sibling and fail
+open when none exists, so an already-running session does not emit hook errors.
+
 Codex plugin installation does not run lifecycle scripts or rewrite `~/.codex/AGENTS.md`.
 The plugin skill and hooks carry the runtime policy. `AGENTS.md` is Codex's durable
 repository guidance surface; this checkout includes one for contributors.

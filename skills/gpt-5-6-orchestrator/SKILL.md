@@ -9,6 +9,8 @@ Keep GPT-5.6 Sol in the main interactive session at the configured reasoning tar
 
 Once this installed plugin's command hooks are trusted, its `UserPromptSubmit` hook activates the workflow automatically for every main-session prompt. The exact `$gpt-5-6-orchestrator` token remains an explicit fallback when `GPT56_ORCHESTRATOR_AUTO=0`; `GPT56_ORCHESTRATOR_DISABLE=1` disables all plugin hooks. Never apply main-session activation to child-agent prompts.
 
+Each hook launcher validates the session-captured plugin root. When an upgrade has pruned that version, it may resolve only the newest installed sibling with the canonical plugin identity, a matching version directory, and regular non-symlink hook files. If no valid root exists, the launcher must fail open without blocking the Codex turn.
+
 ## Runtime contract
 
 Start the main session with:

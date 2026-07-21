@@ -21,7 +21,7 @@ async function read(relativePath) {
 test('manifest exposes the canonical GPT-5.6 Orchestrator identity', async () => {
   const manifest = JSON.parse(await read('.codex-plugin/plugin.json'))
   assert.equal(manifest.name, 'gpt-5-6-orchestrator')
-  assert.match(manifest.version, /^0\.3\.2(?:\+codex\.\d{14})?$/)
+  assert.match(manifest.version, /^0\.3\.3(?:\+codex\.\d{14})?$/)
   assert.equal(manifest.skills, './skills/')
   assert.equal(manifest.interface.displayName, 'GPT-5.6 Orchestrator')
   assert.deepEqual(manifest.interface.capabilities, ['Interactive', 'Read', 'Write'])
@@ -36,19 +36,31 @@ test('manifest exposes the canonical GPT-5.6 Orchestrator identity', async () =>
   assert.doesNotMatch(prompt, /model fusion/i)
 })
 
-test('hook manifest uses PLUGIN_ROOT and points to the renamed handler', async () => {
+test('hook manifest uses an upgrade-resilient fail-open launcher for every event', async () => {
   const hooks = JSON.parse(await read('hooks/hooks.json'))
-  for (const groups of Object.values(hooks.hooks)) {
+  const actions = {
+    SessionStart: 'session-start',
+    PostCompact: 'post-compact',
+    UserPromptSubmit: 'user-prompt-submit',
+    PreToolUse: 'pre-tool-use',
+    SubagentStart: 'subagent-start',
+    SubagentStop: 'subagent-stop',
+    Stop: 'stop',
+  }
+  for (const [event, groups] of Object.entries(hooks.hooks)) {
     for (const group of groups) {
       for (const handler of group.hooks) {
         assert.match(handler.command, /PLUGIN_ROOT/)
         assert.match(handler.command, /orchestrator-hook\.mjs/)
-        const relativeScript = handler.command.match(/PLUGIN_ROOT}\/([^" ]+)/)?.[1]
-        assert.ok(relativeScript)
-        await access(path.join(root, relativeScript))
+        assert.match(handler.command, /--input-type=module/)
+        assert.match(handler.command, /gpt-5-6-orchestrator/)
+        assert.match(handler.command, /isSymbolicLink/)
+        assert.match(handler.command, new RegExp(` ${actions[event]}$`))
+        assert.doesNotMatch(handler.command, /\/Users\/|personal\/gpt-5-6-orchestrator/)
       }
     }
   }
+  await access(path.join(root, 'hooks', 'orchestrator-hook.mjs'))
   assert.ok(hooks.hooks.UserPromptSubmit)
   assert.ok(hooks.hooks.SessionStart)
   assert.ok(hooks.hooks.PostCompact)
@@ -86,6 +98,8 @@ test('skill defines a Sol-main-session dynamic workflow', async () => {
   assert.match(skill, /main Sol session is the judge/i)
   assert.match(skill, /lead-session plus dynamic-worker pattern/i)
   assert.match(skill, /activates the workflow automatically for every main-session prompt/i)
+  assert.match(skill, /upgrade has pruned that version.*newest installed sibling/is)
+  assert.match(skill, /matching version directory.*non-symlink hook files/is)
   assert.match(skill, /Clarification gate/i)
   assert.match(skill, /Workers never ask the user/i)
   assert.match(skill, /\.workflow\/LEDGER\.md/)
@@ -160,6 +174,8 @@ test('README is concise and shows Sol controlling dynamic Codex subagents', asyn
   assert.match(readme, /There is no worker judge/i)
   assert.match(readme, /\$gpt-5-6-orchestrator/)
   assert.match(readme, /Automatic activation applies to main-session prompts/i)
+  assert.match(readme, /later upgrade has\s+pruned that version.*newest valid installed sibling/is)
+  assert.match(readme, /fail\s+open when none exists.*already-running session/is)
   assert.match(readme, /Codex plugin installation does not run lifecycle scripts/i)
   assert.match(readme, /codex -m gpt-5\.6-sol.*model_reasoning_effort/)
   assert.match(readme, /config --sol-effort high/)

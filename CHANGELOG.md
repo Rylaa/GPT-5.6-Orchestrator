@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.3 - 2026-07-21
+
+- Keep all hook events working when a plugin upgrade prunes the version directory captured by an already-running Codex session.
+- Validate fallback installations by plugin identity, version directory, regular files, and non-symlink entry points; remain fail-open when no valid installation exists.
+
 ## 0.3.2 - 2026-07-21
 
 - Replace the terse tmux worker table with novice-readable live agent cards showing identity, task, current step, elapsed time, recent work, and report state.
