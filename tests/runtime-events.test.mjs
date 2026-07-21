@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { parseRuntimeProofFile, readLatestActivity } from '../lib/runtime-events.mjs'
+import { parseRuntimeProofFile, readLatestActivity, sanitizeActivityText } from '../lib/runtime-events.mjs'
 
 async function eventFile(lines) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'g56o-events-'))
@@ -120,6 +120,19 @@ test('renders safe human activity without exposing raw commands, output, or cred
   ])
   assert.match(activity.recent[0].summary, /Searched source code.*CommentIntelligenceScreen\.swift/)
   assert.doesNotMatch(JSON.stringify(activity), /super-secret|hunter2|ghp_|sk-proj-/)
+})
+
+test('redacts bearer credentials and truncates without splitting Unicode code points', () => {
+  assert.equal(
+    sanitizeActivityText('Authorization: Bearer canary-secret'),
+    'Authorization=[redacted]',
+  )
+  assert.equal(
+    sanitizeActivityText('token: Basic encoded-canary'),
+    'token=[redacted]',
+  )
+  assert.equal(sanitizeActivityText('abc😀def', 5), 'abc😀…')
+  assert.equal(sanitizeActivityText('safe\u202eevil\u2066text'), 'safe evil text')
 })
 
 test('distinguishes common work categories and treats empty searches as useful evidence', async () => {

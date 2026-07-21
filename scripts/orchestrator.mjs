@@ -72,6 +72,9 @@ const DEFAULT_EXECUTION_TIMEOUT_SECONDS = 1800
 const MAX_EXECUTION_TIMEOUT_SECONDS = 86_400
 const PROCESS_HEARTBEAT_STALE_MS = 10_000
 const CONTROLLER_LOCK_STALE_MS = 30_000
+const CHILD_TERMINATION_GRACE_MS = 2_000
+const TMUX_COMMAND_TIMEOUT_MS = 1_500
+const TMUX_COMMAND_MAX_OUTPUT_BYTES = 64 * 1024
 const TMUX_PANE_MARKER_OPTION = '@gpt56_orchestrator_run'
 const TMUX_PANE_TITLE = 'GPT-5.6 agents'
 const AUTO_PANE_DISABLED_VALUES = new Set(['0', 'false', 'no', 'off'])
@@ -242,6 +245,20 @@ function isProcessAlive(pid) {
   } catch (error) {
     return error?.code === 'EPERM'
   }
+}
+
+function signalChildProcessTree(child, signal) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return false
+  if (process.platform !== 'win32' && Number.isInteger(child.pid) && child.pid > 1) {
+    try {
+      process.kill(-child.pid, signal)
+      return true
+    } catch (error) {
+      if (error?.code === 'ESRCH') return false
+      if (!['EPERM', 'EINVAL'].includes(error?.code)) throw error
+    }
+  }
+  return child.kill(signal)
 }
 
 function timestampId() {
@@ -758,19 +775,23 @@ async function reportEvidence(outputPath) {
   }
 }
 
+async function writeHeartbeat({ dataDir, record, heartbeatPath }) {
+  await writeJsonAtomic(heartbeatPath, {
+    schemaVersion: 1,
+    runId: record.runId,
+    workerId: record.workerId,
+    processToken: record.processToken,
+    pid: process.pid,
+    at: new Date().toISOString(),
+  })
+}
+
 async function startHeartbeat({ dataDir, record, heartbeatPath }) {
   let stopped = false
   let timer = null
   const write = async () => {
     if (stopped) return
-    await writeJsonAtomic(heartbeatPath, {
-      schemaVersion: 1,
-      runId: record.runId,
-      workerId: record.workerId,
-      processToken: record.processToken,
-      pid: process.pid,
-      at: new Date().toISOString(),
-    })
+    await writeHeartbeat({ dataDir, record, heartbeatPath })
     if (!stopped) {
       timer = setTimeout(() => { write().catch(() => {}) }, 1_000)
       timer.unref?.()
@@ -847,6 +868,10 @@ export async function runWorker({ runId, workerId, dataDir = defaultDataDir(), e
       stderrPath,
       baselinePath: baseline ? baselinePath : null,
     }
+    // Publish the authenticated heartbeat before making `running` visible.
+    // stopWorkers can therefore always signal a running controller, including
+    // the narrow startup window before Codex itself has been spawned.
+    await writeHeartbeat({ dataDir, record: running, heartbeatPath })
     await writeWorkerRecord(dataDir, runId, workerId, running)
     return running
   })
@@ -869,11 +894,13 @@ export async function runWorker({ runId, workerId, dataDir = defaultDataDir(), e
   const requestTermination = (reason, signal = 'SIGTERM') => {
     terminationReason ||= reason
     if (!child || child.exitCode !== null || child.signalCode !== null) return
-    child.kill(signal)
+    signalChildProcessTree(child, signal)
     if (!forceTimer) {
       forceTimer = setTimeout(() => {
-        if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
-      }, 2_000)
+        if (child && child.exitCode === null && child.signalCode === null) {
+          signalChildProcessTree(child, 'SIGKILL')
+        }
+      }, CHILD_TERMINATION_GRACE_MS)
       forceTimer.unref?.()
     }
   }
@@ -881,6 +908,15 @@ export async function runWorker({ runId, workerId, dataDir = defaultDataDir(), e
   const onSigint = () => requestTermination('controller-interrupt', 'SIGINT')
   try {
     stopHeartbeat = await startHeartbeat({ dataDir, record, heartbeatPath })
+    await withControllerLock(dataDir, async () => {
+      const current = await readContainedBoundedJson(
+        runsDir(dataDir),
+        path.join(targetWorkerDir, 'worker.json'),
+      )
+      if (current.status !== 'running' || current.processToken !== record.processToken) {
+        throw new Error(`Worker was stopped before Codex launch: ${workerId}`)
+      }
+    })
     eventsHandle = await openPrivateOutput(eventsPath)
     stderrHandle = await openPrivateOutput(stderrPath)
     const workerEnv = {
@@ -892,13 +928,16 @@ export async function runWorker({ runId, workerId, dataDir = defaultDataDir(), e
       pluginsDisabled: args.some((arg, index) => arg === '--disable' && args[index + 1] === 'plugins'),
       orchestratorHooksDisabled: workerEnv.GPT56_ORCHESTRATOR_DISABLE === '1',
     }
+    process.once('SIGTERM', onSigterm)
+    process.once('SIGINT', onSigint)
     child = spawn(codexBin, args, {
       cwd: run.cwd,
       env: workerEnv,
+      // Give Codex and any tools it starts a dedicated process group so stop
+      // and timeout requests cannot leave descendants running in the background.
+      detached: process.platform !== 'win32',
       stdio: ['pipe', eventsHandle.fd, stderrHandle.fd],
     })
-    process.once('SIGTERM', onSigterm)
-    process.once('SIGINT', onSigint)
     timeoutTimer = setTimeout(
       () => requestTermination('execution-timeout'),
       record.executionTimeoutSeconds * 1_000,
@@ -1352,7 +1391,7 @@ function dashboardModelTone(worker) {
 function dashboardWidth(value) {
   const width = Number(value)
   if (!Number.isFinite(width)) return 100
-  return Math.max(16, Math.min(160, Math.floor(width)))
+  return Math.max(1, Math.min(160, Math.floor(width)))
 }
 
 function dashboardElapsed(value) {
@@ -1362,6 +1401,75 @@ function dashboardElapsed(value) {
   return minutes ? `${minutes}m${String(seconds % 60).padStart(2, '0')}s` : `${seconds}s`
 }
 
+const DASHBOARD_GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+const DASHBOARD_EMOJI_RE = /\p{Extended_Pictographic}|\p{Regional_Indicator}/u
+const DASHBOARD_MARK_RE = /\p{Mark}/u
+
+function dashboardGraphemes(value) {
+  return [...DASHBOARD_GRAPHEME_SEGMENTER.segment(String(value || ''))]
+    .map(({ segment }) => segment)
+}
+
+function isFullwidthCodePoint(codePoint) {
+  return codePoint >= 0x1100 && (
+    codePoint <= 0x115f
+    || codePoint === 0x2329
+    || codePoint === 0x232a
+    || (codePoint >= 0x2e80 && codePoint <= 0xa4cf && codePoint !== 0x303f)
+    || (codePoint >= 0xac00 && codePoint <= 0xd7a3)
+    || (codePoint >= 0xf900 && codePoint <= 0xfaff)
+    || (codePoint >= 0xfe10 && codePoint <= 0xfe19)
+    || (codePoint >= 0xfe30 && codePoint <= 0xfe6f)
+    || (codePoint >= 0xff00 && codePoint <= 0xff60)
+    || (codePoint >= 0xffe0 && codePoint <= 0xffe6)
+    || (codePoint >= 0x1b000 && codePoint <= 0x1b2ff)
+    || (codePoint >= 0x1f200 && codePoint <= 0x1f251)
+    || (codePoint >= 0x20000 && codePoint <= 0x3fffd)
+  )
+}
+
+function dashboardGraphemeWidth(grapheme) {
+  if (!grapheme) return 0
+  if (DASHBOARD_EMOJI_RE.test(grapheme) || grapheme.includes('\u20e3')) return 2
+  let width = 0
+  for (const character of grapheme) {
+    const codePoint = character.codePointAt(0)
+    if (
+      codePoint === 0x200d
+      || (codePoint >= 0xfe00 && codePoint <= 0xfe0f)
+      || (codePoint >= 0xe0100 && codePoint <= 0xe01ef)
+      || DASHBOARD_MARK_RE.test(character)
+    ) continue
+    width += isFullwidthCodePoint(codePoint) ? 2 : 1
+  }
+  return width
+}
+
+function dashboardTextWidth(value) {
+  return dashboardGraphemes(value)
+    .reduce((width, grapheme) => width + dashboardGraphemeWidth(grapheme), 0)
+}
+
+function takeDashboardText(value, width, { replaceOversized = false } = {}) {
+  const graphemes = dashboardGraphemes(value)
+  let head = ''
+  let used = 0
+  let consumed = 0
+  for (const grapheme of graphemes) {
+    const graphemeWidth = dashboardGraphemeWidth(grapheme)
+    if (used + graphemeWidth > width) {
+      if (!head && replaceOversized && width >= 1) {
+        return { head: '…', tail: graphemes.slice(1).join('') }
+      }
+      break
+    }
+    head += grapheme
+    used += graphemeWidth
+    consumed += 1
+  }
+  return { head, tail: graphemes.slice(consumed).join('') }
+}
+
 function wrapDashboardText(value, width, { maxLines = Infinity } = {}) {
   const normalized = sanitizeActivityText(value, 600) || '-'
   const words = normalized.split(' ')
@@ -1369,17 +1477,18 @@ function wrapDashboardText(value, width, { maxLines = Infinity } = {}) {
   let current = ''
   for (const originalWord of words) {
     let word = originalWord
-    while (word.length > width) {
+    while (dashboardTextWidth(word) > width) {
       if (current) {
         lines.push(current)
         current = ''
       }
-      lines.push(word.slice(0, width))
-      word = word.slice(width)
+      const chunk = takeDashboardText(word, width, { replaceOversized: true })
+      lines.push(chunk.head)
+      word = chunk.tail
     }
     if (!word) continue
     if (!current) current = word
-    else if (current.length + word.length + 1 <= width) current += ` ${word}`
+    else if (dashboardTextWidth(current) + dashboardTextWidth(word) + 1 <= width) current += ` ${word}`
     else {
       lines.push(current)
       current = word
@@ -1391,10 +1500,15 @@ function wrapDashboardText(value, width, { maxLines = Infinity } = {}) {
   const limited = wrapped.slice(0, Math.max(1, Math.floor(maxLines)))
   const lastIndex = limited.length - 1
   const last = limited[lastIndex]
-  limited[lastIndex] = last.length >= width
-    ? `${last.slice(0, Math.max(0, width - 1))}…`
-    : `${last}…`
+  limited[lastIndex] = truncateDashboardText(`${last}…`, width)
   return limited
+}
+
+function truncateDashboardText(value, width) {
+  const normalized = sanitizeActivityText(value, 600) || '-'
+  if (dashboardTextWidth(normalized) <= width) return normalized
+  if (width <= 1) return '…'
+  return `${takeDashboardText(normalized, width - 1).head}…`
 }
 
 function dashboardField(label, value, width, labelWidth = 12, {
@@ -1403,8 +1517,12 @@ function dashboardField(label, value, width, labelWidth = 12, {
   valueTone = null,
   maxLines = Infinity,
 } = {}) {
+  if (width < labelWidth + 4) {
+    return wrapDashboardText(`${label}: ${value}`, width, { maxLines })
+      .map((line) => dashboardTone(line, valueTone || labelTone, color))
+  }
   const prefix = `${label}:`.padEnd(labelWidth)
-  const available = Math.max(4, width - prefix.length)
+  const available = Math.max(1, width - prefix.length)
   return wrapDashboardText(value, available, { maxLines }).map((line, index) => (
     `${index === 0 ? dashboardTone(prefix, labelTone, color) : ' '.repeat(prefix.length)}${dashboardTone(line, valueTone, color)}`
   ))
@@ -1429,7 +1547,11 @@ function dashboardActivityLines(worker, width, { color = false, maxItems = 2 } =
   const recent = Array.isArray(worker.activity?.recent) ? worker.activity.recent.slice(-maxItems) : []
   if (recent.length === 0) {
     const prefix = '  · '
-    return wrapDashboardText('No tool activity recorded yet', Math.max(4, width - prefix.length))
+    if (width <= prefix.length) {
+      return wrapDashboardText('No tool activity recorded yet', width)
+        .map((line) => dashboardTone(line, 'dim', color))
+    }
+    return wrapDashboardText('No tool activity recorded yet', width - prefix.length)
       .map((line, index) => dashboardTone(
         `${index === 0 ? prefix : ' '.repeat(prefix.length)}${line}`,
         'dim',
@@ -1442,21 +1564,33 @@ function dashboardActivityLines(worker, width, { color = false, maxItems = 2 } =
     const markerTone = dashboardStatusTone(activity.state)
     const plainPrefix = `  ${marker} `
     const styledPrefix = `  ${dashboardTone(marker, ['bold', markerTone], color)} `
-    const available = Math.max(4, width - plainPrefix.length)
+    if (width <= plainPrefix.length) {
+      lines.push(...wrapDashboardText(activity.summary, width, { maxLines: 1 })
+        .map((line) => dashboardTone(line, markerTone, color)))
+      continue
+    }
+    const available = width - plainPrefix.length
     const wrapped = wrapDashboardText(activity.summary, available, { maxLines: 1 })
     lines.push(...wrapped.map((line, index) => `${index === 0 ? styledPrefix : ' '.repeat(plainPrefix.length)}${line}`))
   }
   return lines
 }
 
-export function renderDashboard(status, { width = 100, height, color = false } = {}) {
+export function renderDashboard(status, {
+  width = 100,
+  height,
+  color = false,
+  activeOnly = false,
+} = {}) {
   const columns = dashboardWidth(width)
   const maxHeight = Number.isFinite(Number(height)) && Number(height) > 0
-    ? Math.max(8, Math.floor(Number(height)))
+    ? Math.max(1, Math.floor(Number(height)))
     : null
   const cap = (value) => maxHeight ? value : Infinity
   const divider = dashboardTone('─'.repeat(columns), ['dim', 'cyan'], color)
-  const workers = Array.isArray(status.workers) ? status.workers : []
+  const allWorkers = Array.isArray(status.workers) ? status.workers : []
+  const activeWorkers = allWorkers.filter((worker) => !TERMINAL_STATES.has(worker.status))
+  const workers = activeOnly && activeWorkers.length > 0 ? activeWorkers : allWorkers
   const counts = ['running', 'queued', 'completed', 'failed', 'stopped']
     .filter((state) => Number(status.counts?.[state]) > 0)
     .map((state) => `${status.counts[state]} ${state}`)
@@ -1483,6 +1617,7 @@ export function renderDashboard(status, { width = 100, height, color = false } =
 
   const fullSections = []
   const compactSections = []
+  const denseSections = []
   const minimalSections = []
 
   if (workers.length === 0) {
@@ -1506,10 +1641,23 @@ export function renderDashboard(status, { width = 100, height, color = false } =
       : worker.status === 'failed' || worker.status === 'stopped'
         ? `Not accepted: ${reportName}`
         : `Pending: ${reportName}`
-    const workerHeading = `[${index + 1}/${workers.length}] ${sanitizeActivityText(worker.workerId, 80) || 'agent'}  ·  ${statusLabel}  ·  ${dashboardElapsed(worker.elapsedMs)}`
+    let position = `[${index + 1}/${workers.length}] `
+    let statusSuffix = ` · ${statusLabel}`
+    const elapsedSuffix = ` · ${dashboardElapsed(worker.elapsedMs)}`
+    const workerId = sanitizeActivityText(worker.workerId, 80) || 'agent'
+    if (position.length + 4 + statusSuffix.length > columns) {
+      position = `${index + 1}/${workers.length} `
+      statusSuffix = ` ${statusLabel}`
+    }
+    const suffix = position.length + dashboardTextWidth(workerId) + statusSuffix.length + elapsedSuffix.length <= columns
+      ? `${statusSuffix}${elapsedSuffix}`
+      : statusSuffix
+    const workerHeading = truncateDashboardText(`${position}${truncateDashboardText(
+      workerId,
+      Math.max(1, columns - position.length - suffix.length),
+    )}${suffix}`, columns)
     const statusTone = dashboardStatusTone(worker.status)
-    const heading = wrapDashboardText(workerHeading, columns, { maxLines: cap(1) })
-      .map((line) => dashboardTone(line, ['bold', statusTone], color))
+    const heading = [dashboardTone(workerHeading, ['bold', statusTone], color)]
     const reportField = dashboardField('Report', reportState, columns, 12, {
       color,
       valueTone: statusTone,
@@ -1549,12 +1697,27 @@ export function renderDashboard(status, { width = 100, height, color = false } =
         valueTone: dashboardModelTone(worker),
         maxLines: 1,
       }),
+      ...dashboardField('Task', task, columns, 12, { color, maxLines: 1 }),
       ...dashboardField('Now', currentWorkerActivity(worker), columns, 12, {
         color,
         valueTone: statusTone,
         maxLines: 1,
       }),
       ...reportField,
+    ])
+    denseSections.push([
+      ...heading,
+      ...dashboardField('Agent', dashboardModel(worker), columns, 12, {
+        color,
+        valueTone: dashboardModelTone(worker),
+        maxLines: 1,
+      }),
+      ...dashboardField('Task', task, columns, 12, { color, maxLines: 1 }),
+      ...dashboardField('Now', currentWorkerActivity(worker), columns, 12, {
+        color,
+        valueTone: statusTone,
+        maxLines: 1,
+      }),
     ])
     minimalSections.push([divider, ...heading])
   })
@@ -1569,6 +1732,7 @@ export function renderDashboard(status, { width = 100, height, color = false } =
       .map((line) => dashboardTone(line, 'dim', color)),
   ]
   const compose = (start, sections) => [...start, ...sections.flat(), ...footer]
+  const composeDense = (start) => [...start, divider, ...denseSections.flat(), ...footer]
   let output = compose(header, fullSections)
   if (maxHeight && output.length > maxHeight) output = compose(header, compactSections)
   if (maxHeight && output.length > maxHeight) {
@@ -1578,14 +1742,19 @@ export function renderDashboard(status, { width = 100, height, color = false } =
       valueTone: status.complete ? 'green' : Number(status.counts?.failed) > 0 ? 'red' : 'cyan',
     })]
     output = compose(minimalHeader, compactSections)
+    if (output.length > maxHeight) output = composeDense(minimalHeader)
     if (output.length > maxHeight) output = compose(minimalHeader, minimalSections)
   }
   if (maxHeight && output.length > maxHeight) {
     const hidden = output.length - maxHeight + 1
-    output = [
-      ...output.slice(0, Math.max(1, maxHeight - 1)),
-      dashboardTone(`… ${hidden} more lines`, ['dim', 'yellow'], color),
-    ]
+    const truncationNotice = dashboardTone(
+      truncateDashboardText(`… ${hidden} more lines`, columns),
+      ['dim', 'yellow'],
+      color,
+    )
+    output = maxHeight === 1
+      ? [truncationNotice]
+      : [...output.slice(0, maxHeight - 1), truncationNotice]
   }
   return output.join('\n')
 }
@@ -1631,10 +1800,11 @@ export async function runDashboard({
         // the following newline. Reserve one column so repeated tmux redraws stay
         // anchored instead of scrolling and merging old text into the new frame.
         width: Number.isFinite(Number(process.stdout.columns))
-          ? Math.max(16, Number(process.stdout.columns) - 1)
+          ? Math.max(1, Number(process.stdout.columns) - 1)
           : process.stdout.columns,
         height: process.stdout.rows,
         color: useColor,
+        activeOnly: watch,
       })
       if (watch) {
         // Clearing each reused row prevents shorter status text from leaving a
@@ -1645,7 +1815,14 @@ export async function runDashboard({
       } else {
         write(`${rendered}\n`)
       }
-      if (!watch || (status.complete && !keepOpen)) return status
+      if (!watch) return status
+      if (status.complete && !keepOpen) {
+        // Recheck and retire the pane marker under the same controller lock
+        // used to add workers. A new launch therefore either keeps this
+        // watcher alive or observes a retired marker and opens a fresh pane.
+        const canExit = await retireCompletedDashboard({ runId, dataDir, env })
+        if (canExit) return status
+      }
       await delay(normalizedInterval)
     } while (watch)
     return null
@@ -1667,7 +1844,13 @@ export function buildPaneDashboardCommand({
 }) {
   const normalizedRunId = assertIdentifier(runId, 'run id')
   const normalizedInterval = normalizeIntervalMs(intervalMs)
-  const command = ['env', `GPT56_ORCHESTRATOR_COLOR=${color ? '1' : '0'}`]
+  const resolvedDataDir = dataDir ? path.resolve(dataDir) : defaultDataDir()
+  const paneMarker = tmuxPaneMarker({ runId: normalizedRunId, dataDir: resolvedDataDir })
+  const command = [
+    'env',
+    `GPT56_ORCHESTRATOR_COLOR=${color ? '1' : '0'}`,
+    `GPT56_ORCHESTRATOR_PANE_MARKER=${paneMarker}`,
+  ]
   if (dataDir) command.push(`GPT56_ORCHESTRATOR_DATA_DIR=${path.resolve(dataDir)}`)
   command.push(nodeBin)
   return [...command, SCRIPT_PATH, 'dashboard', '--run', normalizedRunId, '--watch', '--interval-ms', normalizedInterval]
@@ -1675,15 +1858,44 @@ export function buildPaneDashboardCommand({
     .join(' ')
 }
 
-function runChild(command, args, { env = process.env } = {}) {
+function runChild(command, args, {
+  env = process.env,
+  timeoutMs = TMUX_COMMAND_TIMEOUT_MS,
+  maxOutputBytes = TMUX_COMMAND_MAX_OUTPUT_BYTES,
+} = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { env, stdio: ['ignore', 'pipe', 'pipe'] })
     let stdout = ''
     let stderr = ''
-    child.stdout.on('data', (chunk) => { stdout += chunk })
-    child.stderr.on('data', (chunk) => { stderr += chunk })
-    child.once('error', reject)
-    child.once('close', (code, signal) => resolve({ code, signal, stdout, stderr }))
+    let outputBytes = 0
+    let settled = false
+    const finish = (callback, value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      callback(value)
+    }
+    const failAndKill = (message) => {
+      if (settled) return
+      child.kill('SIGKILL')
+      finish(reject, new Error(message))
+    }
+    const append = (stream, chunk) => {
+      if (settled) return stream
+      outputBytes += chunk.length
+      if (outputBytes > maxOutputBytes) {
+        failAndKill(`${command} output exceeded ${maxOutputBytes} bytes`)
+        return stream
+      }
+      return stream + chunk
+    }
+    const timeout = setTimeout(() => {
+      failAndKill(`${command} timed out after ${timeoutMs}ms`)
+    }, timeoutMs)
+    child.stdout.on('data', (chunk) => { stdout = append(stdout, chunk) })
+    child.stderr.on('data', (chunk) => { stderr = append(stderr, chunk) })
+    child.once('error', (error) => finish(reject, error))
+    child.once('close', (code, signal) => finish(resolve, { code, signal, stdout, stderr }))
   })
 }
 
@@ -1693,10 +1905,50 @@ function tmuxPaneMarker({ runId, dataDir }) {
     .digest('hex')
 }
 
+async function retireCompletedDashboard({ runId, dataDir, env }) {
+  return withControllerLock(dataDir, async () => {
+    await loadRun({ runId, dataDir })
+    const workers = (await reconcileAllWorkersUnlocked(dataDir))
+      .filter((worker) => worker.runId === runId)
+    if (workers.length === 0 || workers.some((worker) => !TERMINAL_STATES.has(worker.status))) {
+      return false
+    }
+
+    const declaredMarker = String(env.GPT56_ORCHESTRATOR_PANE_MARKER || '').trim()
+    if (!declaredMarker || !env.TMUX || !env.TMUX_PANE) return true
+    const expectedMarker = tmuxPaneMarker({ runId, dataDir })
+    if (declaredMarker !== expectedMarker) return true
+    const tmuxBin = env.GPT56_ORCHESTRATOR_TMUX_BIN || 'tmux'
+    try {
+      const inspected = await runChild(tmuxBin, [
+        'display-message', '-p', '-t', env.TMUX_PANE, `#{${TMUX_PANE_MARKER_OPTION}}`,
+      ], { env })
+      if (inspected.code !== 0) return false
+      const currentMarker = inspected.stdout.trim()
+      // An empty value is the short startup window before openTmuxPane marks
+      // the new split. A different non-empty marker means this pane was
+      // deliberately retired or reassigned, so this watcher must exit.
+      if (!currentMarker) return false
+      if (currentMarker !== expectedMarker) return true
+      const retired = await runChild(tmuxBin, [
+        'set-option', '-p', '-t', env.TMUX_PANE,
+        TMUX_PANE_MARKER_OPTION, `retiring:${expectedMarker}`,
+      ], { env })
+      return retired.code === 0
+    } catch {
+      // Keep the watcher alive and retry. Disappearing is worse than a pane
+      // that needs manual closing while tmux itself is unhealthy.
+      return false
+    }
+  })
+}
+
 async function findTmuxDashboardPane({ runId, dataDir, env }) {
   const tmuxBin = env.GPT56_ORCHESTRATOR_TMUX_BIN || 'tmux'
   const marker = tmuxPaneMarker({ runId, dataDir })
-  const listArgs = ['list-panes']
+  // Search every window in the current tmux session. Limiting the lookup to
+  // one window can create duplicate sidebars when Codex is moved or relaunched.
+  const listArgs = ['list-panes', '-s']
   if (env.TMUX_PANE) listArgs.push('-t', env.TMUX_PANE)
   listArgs.push('-F', `#{pane_id}\t#{${TMUX_PANE_MARKER_OPTION}}`)
   const listed = await runChild(tmuxBin, listArgs, { env })

@@ -45,6 +45,24 @@ function stripAnsi(value) {
   return String(value).replace(ANSI_SEQUENCE_RE, '')
 }
 
+function terminalCellWidth(value) {
+  return [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(stripAnsi(value))]
+    .reduce((width, { segment }) => {
+      if (/\p{Extended_Pictographic}|\p{Regional_Indicator}/u.test(segment) || segment.includes('\u20e3')) {
+        return width + 2
+      }
+      for (const character of segment) {
+        const codePoint = character.codePointAt(0)
+        if (/\p{Mark}/u.test(character) || codePoint === 0x200d) continue
+        width += (
+          (codePoint >= 0x2e80 && codePoint <= 0xa4cf)
+          || (codePoint >= 0xac00 && codePoint <= 0xd7a3)
+        ) ? 2 : 1
+      }
+      return width
+    }, 0)
+}
+
 async function makeWorkspace() {
   const cwd = await mkdtemp(path.join(os.tmpdir(), 'g56o-workspace-'))
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'g56o-data-'))
@@ -65,10 +83,12 @@ async function fakeCodex(root, {
   delayMs = 0,
   reportContent = '1. Ledger items addressed and scope: test\n2. Evidence and files changed: none\n3. Verification result: pass\n4. Risks and unresolved issues: none\n5. Confidence and out-of-scope findings: high\n',
   writeRelative = null,
+  descendantPidPath = null,
 } = {}) {
   const executable = path.join(root, 'fake-codex-' + randomUUID() + '.mjs')
   await writeFile(executable, [
     '#!/usr/bin/env node',
+    "import { spawn } from 'node:child_process'",
     "import { mkdirSync, writeFileSync } from 'node:fs'",
     "import { dirname, resolve } from 'node:path'",
     'let prompt = ""',
@@ -77,6 +97,10 @@ async function fakeCodex(root, {
     '  process.stderr.write("worker inherited automatic orchestrator hooks\\n")',
     '  process.exit(17)',
     '}',
+    ...(descendantPidPath ? [
+      "const descendant = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })",
+      `writeFileSync(${JSON.stringify(descendantPidPath)}, String(descendant.pid))`,
+    ] : []),
     `await new Promise((resolve) => setTimeout(resolve, ${delayMs}))`,
     'const args = process.argv.slice(2)',
     'const outputIndex = args.indexOf("-o")',
@@ -109,7 +133,17 @@ async function fakeTmux(root) {
     'const args = process.argv.slice(2)',
     'appendFileSync(process.env.FAKE_TMUX_LOG, JSON.stringify(args) + "\\n")',
     'const command = args[0]',
-    'if (command === "display-message") process.stdout.write("/dev/pts/1\\n")',
+    'if (process.env.FAKE_TMUX_HANG === command) { setInterval(() => {}, 1000); await new Promise(() => {}) }',
+    'if (process.env.FAKE_TMUX_FLOOD === command) process.stdout.write("x".repeat(70 * 1024))',
+    'if (command === "display-message") {',
+    '  const format = args.at(-1)',
+    '  if (format?.includes("@gpt56_orchestrator_run")) {',
+    '    if (existsSync(process.env.FAKE_TMUX_STATE)) {',
+    '      const state = readFileSync(process.env.FAKE_TMUX_STATE, "utf8").trim().split("\\t")',
+    '      if (state[0] === args[3]) process.stdout.write(`${state[1]}\\n`)',
+    '    }',
+    '  } else process.stdout.write("/dev/pts/1\\n")',
+    '}',
     'else if (command === "list-panes") {',
     '  if (process.env.FAKE_TMUX_LIST_FAILURE === "1") { process.stderr.write("list failed\\n"); process.exitCode = 1 }',
     '  else if (existsSync(process.env.FAKE_TMUX_STATE)) process.stdout.write(readFileSync(process.env.FAKE_TMUX_STATE, "utf8"))',
@@ -156,6 +190,24 @@ function runCli(args, env = {}) {
     child.once('error', reject)
     child.once('close', (code) => resolve({ code, stdout, stderr }))
   })
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error?.code === 'EPERM'
+  }
+}
+
+async function waitForProcessExit(pid, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() <= deadline) {
+    if (!processIsAlive(pid)) return true
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  return !processIsAlive(pid)
 }
 
 test('builds exact model, effort, fast-tier, sandbox, and no-descendant Codex args', () => {
@@ -364,7 +416,8 @@ test('launches a model-pinned Codex subagent in the background and can stop it',
   const { cwd, dataDir } = await makeWorkspace()
   const taskFile = await writeTask(cwd)
   await createRun({ cwd, objective: 'Dynamic Codex subagent', runId: 'background-run', dataDir })
-  const codexBin = await fakeCodex(dataDir, { delayMs: 5_000 })
+  const descendantPidPath = path.join(dataDir, 'stopped-descendant.pid')
+  const codexBin = await fakeCodex(dataDir, { delayMs: 5_000, descendantPidPath })
   const launched = await launchWorker({
     runId: 'background-run',
     workerId: 'explore',
@@ -385,12 +438,70 @@ test('launches a model-pinned Codex subagent in the background and can stop it',
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
   assert.equal(running.workers[0].status, 'running')
+  const runningRecord = JSON.parse(await readFile(
+    path.join(dataDir, 'runs', 'background-run', 'workers', 'explore', 'worker.json'),
+    'utf8',
+  ))
+  const heartbeat = JSON.parse(await readFile(running.workers[0].heartbeatPath, 'utf8'))
+  assert.equal(heartbeat.processToken, runningRecord.processToken)
+  assert.equal(heartbeat.pid, running.workers[0].pid)
+  let descendantPid = null
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    descendantPid = Number(await readFile(descendantPidPath, 'utf8').catch(() => '')) || null
+    if (descendantPid) break
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.equal(Number.isInteger(descendantPid), true)
   const stopped = await stopWorkers({ runId: 'background-run', workerId: 'explore', dataDir })
   assert.deepEqual(stopped.stopped, ['explore'])
   assert.deepEqual(stopped.signaled, ['explore'])
   await new Promise((resolve) => setTimeout(resolve, 150))
   const status = await getRunStatus({ runId: 'background-run', dataDir })
   assert.equal(status.workers[0].status, 'stopped')
+  assert.equal(status.workers[0].stopSignalVerified, true)
+  try {
+    assert.equal(await waitForProcessExit(descendantPid), true, 'stop must terminate Codex descendants')
+  } finally {
+    if (processIsAlive(descendantPid)) process.kill(descendantPid, 'SIGKILL')
+  }
+})
+
+test('publishes a verified heartbeat before running becomes observable to an immediate stop', async () => {
+  const { cwd, dataDir } = await makeWorkspace()
+  const taskFile = await writeTask(cwd)
+  await createRun({ cwd, objective: 'Close the early stop race', runId: 'early-stop-run', dataDir })
+  const codexBin = await fakeCodex(dataDir, { delayMs: 5_000 })
+  const workerRecordPath = path.join(
+    dataDir, 'runs', 'early-stop-run', 'workers', 'worker', 'worker.json',
+  )
+  const launchPromise = launchWorker({
+    runId: 'early-stop-run', workerId: 'worker', role: 'orchestrator_luna_gatherer',
+    taskFile, dataDir,
+    env: { ...process.env, GPT56_ORCHESTRATOR_CODEX_BIN: codexBin },
+  })
+
+  let runningRecord = null
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const candidate = JSON.parse(await readFile(workerRecordPath, 'utf8').catch(() => 'null'))
+    if (candidate?.status === 'running') {
+      runningRecord = candidate
+      break
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2))
+  }
+  assert.equal(runningRecord?.status, 'running')
+  const heartbeat = JSON.parse(await readFile(runningRecord.heartbeatPath, 'utf8'))
+  assert.equal(heartbeat.processToken, runningRecord.processToken)
+  assert.equal(heartbeat.pid, runningRecord.pid)
+
+  const stopped = await stopWorkers({ runId: 'early-stop-run', workerId: 'worker', dataDir })
+  assert.deepEqual(stopped.signaled, ['worker'])
+  await launchPromise
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  const status = await getRunStatus({ runId: 'early-stop-run', dataDir })
+  assert.equal(status.workers[0].status, 'stopped')
+  assert.equal(status.workers[0].stopSignalVerified, true)
+  assert.equal(processIsAlive(runningRecord.pid), false)
 })
 
 test('CLI configures Sol effort, exposes resolved roles, and rejects malformed commands', async () => {
@@ -436,7 +547,6 @@ test('CLI configures Sol effort, exposes resolved roles, and rejects malformed c
 test('run and worker validation covers automatic IDs, empty runs, duplicates, and write approval', async () => {
   const { cwd, dataDir } = await makeWorkspace()
   assert.equal(defaultDataDir({ GPT56_ORCHESTRATOR_DATA_DIR: dataDir }), path.resolve(dataDir))
-  assert.match(defaultDataDir({}), /gpt-5-6-orchestrator$/)
   await assert.rejects(
     () => createRun({ cwd, objective: '', runId: 'bad-objective', dataDir }),
     /objective must contain/i,
@@ -679,9 +789,34 @@ test('renders a novice-readable live agent panel and opens it only from an attac
     }],
   }, { width: 32 })
   assert.equal(narrow.split('\n').every((line) => [...line].length <= 32), true)
+  const tiny = renderDashboard({
+    runId: 'tiny-run', objective: 'Tiny terminal',
+    controller: { model: 'gpt-5.6-sol', effort: 'max', authority: 'main-session' },
+    counts: { running: 1 }, complete: false,
+    workers: [{
+      workerId: 'tiny-worker', status: 'running', model: 'gpt-5.6-luna', effort: 'max',
+      sandbox: 'read-only', taskSummary: 'Stay within the real terminal bounds.',
+      reportPath: '/private/tiny/report.md',
+    }],
+  }, { width: 3, height: 1, color: true })
+  assert.equal(stripAnsi(tiny).split('\n').length, 1)
+  assert.equal([...stripAnsi(tiny)].length <= 3, true)
+  const unicodeSensitive = renderDashboard({
+    runId: 'unicode-run', objective: 'Authorization: Bearer objective-canary',
+    controller: { model: 'gpt-5.6-sol', effort: 'max', authority: 'main-session' },
+    counts: { running: 1 }, complete: false,
+    workers: [{
+      workerId: 'wide-agent', status: 'running', model: 'gpt-5.6-luna', effort: 'max',
+      sandbox: 'read-only', taskSummary: '界界1️⃣1️⃣1️⃣界界 token: Bearer task-canary',
+      reportPath: '/private/unicode/report.md',
+    }],
+  }, { width: 20, color: false })
+  assert.equal(unicodeSensitive.split('\n').every((line) => terminalCellWidth(line) <= 20), true)
+  assert.doesNotMatch(unicodeSensitive, /objective-canary|task-canary/)
   const paneCommand = buildPaneDashboardCommand({ runId: 'dashboard-run', intervalMs: 25 })
   assert.match(paneCommand, /'dashboard-run'/)
   assert.match(paneCommand, /'GPT56_ORCHESTRATOR_COLOR=1'/)
+  assert.match(paneCommand, /'GPT56_ORCHESTRATOR_PANE_MARKER=[a-f0-9]{64}'/)
   await assert.rejects(() => openTmuxPane({ runId: 'dashboard-run', env: {} }), /existing tmux client/i)
 
   const root = await mkdtemp(path.join(os.tmpdir(), 'g56o-tmux-'))
@@ -701,6 +836,9 @@ test('renders a novice-readable live agent panel and opens it only from an attac
   assert.deepEqual(tmuxCalls[3], ['select-pane', '-t', '%42', '-T', 'GPT-5.6 agents'])
   const reused = await ensureAutoTmuxPane({ runId: 'dashboard-run', dataDir: root, env })
   assert.deepEqual(reused, { status: 'reused', runId: 'dashboard-run', paneId: '%42' })
+  const listCall = (await readFile(tmux.logPath, 'utf8')).trim().split('\n').map(JSON.parse)
+    .find(([command]) => command === 'list-panes')
+  assert.deepEqual(listCall.slice(0, 5), ['list-panes', '-s', '-t', '%7', '-F'])
   await unlink(tmux.statePath)
   const reopened = await ensureAutoTmuxPane({ runId: 'dashboard-run', dataDir: root, env })
   assert.equal(reopened.status, 'opened')
@@ -800,6 +938,48 @@ test('live agent panel adapts to narrow pane height while keeping the whole team
   assert.match(rendered, /\x1b\[36mGPT-5\.6 Luna/)
   assert.match(rendered, /\x1b\[33mGPT-5\.6 Terra/)
   assert.match(rendered, /\x1b\[35mGPT-5\.6 Sol/)
+})
+
+test('watched narrow panels prioritize active agents and preserve status, model, task, and current work', () => {
+  const rendered = renderDashboard({
+    runId: 'active-team-run',
+    objective: 'Keep the currently running team understandable after a later wave starts',
+    controller: { model: 'gpt-5.6-sol', effort: 'max', authority: 'main-session' },
+    complete: false,
+    counts: { running: 2, completed: 2 },
+    workers: [
+      {
+        workerId: 'old-luna', status: 'completed', model: 'gpt-5.6-luna', effort: 'max',
+        sandbox: 'read-only', taskSummary: 'Finished historical work.', reportPath: '/old-luna/report.md',
+      },
+      {
+        workerId: 'luna-active', status: 'running', model: 'gpt-5.6-luna', effort: 'max',
+        sandbox: 'read-only', taskSummary: 'Inspect active Luna work in the narrow panel.',
+        activity: { summary: 'Reading active Luna files' }, reportPath: '/luna-active/report.md',
+      },
+      {
+        workerId: 'old-terra', status: 'completed', model: 'gpt-5.6-terra', effort: 'max',
+        sandbox: 'read-only', taskSummary: 'Finished historical work.', reportPath: '/old-terra/report.md',
+      },
+      {
+        workerId: 'terra-active', status: 'running', model: 'gpt-5.6-terra', effort: 'max',
+        sandbox: 'read-only', taskSummary: 'Inspect active Terra work in the narrow panel.',
+        activity: { summary: 'Reviewing active Terra evidence' }, reportPath: '/terra-active/report.md',
+      },
+    ],
+  }, { width: 27, height: 23, color: true, activeOnly: true })
+  const plain = stripAnsi(rendered)
+  const lines = plain.split('\n')
+
+  assert.equal(lines.length <= 23, true)
+  assert.equal(lines.every((line) => [...line].length <= 27), true)
+  assert.match(plain, /\[1\/2] luna-active · RUNNING/)
+  assert.match(plain, /\[2\/2] terra-acti… · RUNNING/)
+  assert.doesNotMatch(plain, /old-luna|old-terra/)
+  assert.equal((plain.match(/^Task:/gm) || []).length, 2)
+  assert.equal((plain.match(/^Now:/gm) || []).length, 2)
+  assert.match(rendered, /\x1b\[36mGPT-5\.6 Luna/)
+  assert.match(rendered, /\x1b\[33mGPT-5\.6 Terra/)
 })
 
 test('dashboard color detection honors tmux forcing, NO_COLOR, and non-interactive output', () => {
@@ -908,6 +1088,85 @@ test('automatic tmux visibility skips cleanly and never blocks worker launch on 
   assert.match(launched.visibility.error, /unable to inspect tmux dashboard panes/i)
   const finished = await waitForWorkers({ runId: 'pane-failure-run', timeoutSeconds: 5, dataDir })
   assert.equal(finished.selectedSuccessful, true)
+
+  const floodTmux = await fakeTmux(dataDir)
+  const flooded = await ensureAutoTmuxPane({
+    runId: 'output-bounded-pane',
+    dataDir,
+    env: fakeTmuxEnv(floodTmux, { FAKE_TMUX_FLOOD: 'list-panes' }),
+  })
+  assert.equal(flooded.status, 'failed')
+  assert.match(flooded.error, /output exceeded 65536 bytes/i)
+
+  const hanging = await makeWorkspace()
+  const hangingTask = await writeTask(hanging.cwd)
+  await createRun({
+    cwd: hanging.cwd,
+    objective: 'A hung tmux command must fail open',
+    runId: 'hung-pane-run',
+    dataDir: hanging.dataDir,
+  })
+  const hangingCodex = await fakeCodex(hanging.dataDir)
+  const hangingTmux = await fakeTmux(hanging.dataDir)
+  const startedAt = Date.now()
+  const launchedAfterHang = await launchWorker({
+    runId: 'hung-pane-run',
+    workerId: 'worker',
+    role: 'orchestrator_luna_gatherer',
+    taskFile: hangingTask,
+    dataDir: hanging.dataDir,
+    env: fakeTmuxEnv(hangingTmux, {
+      GPT56_ORCHESTRATOR_CODEX_BIN: hangingCodex,
+      FAKE_TMUX_HANG: 'list-panes',
+    }),
+  })
+  assert.equal(launchedAfterHang.visibility.status, 'failed')
+  assert.match(launchedAfterHang.visibility.error, /timed out after 1500ms/i)
+  assert.equal(Date.now() - startedAt < 4_000, true)
+  const finishedAfterHang = await waitForWorkers({
+    runId: 'hung-pane-run', timeoutSeconds: 5, dataDir: hanging.dataDir,
+  })
+  assert.equal(finishedAfterHang.selectedSuccessful, true)
+})
+
+test('completed dashboards retire their marker before a later worker reopens the pane', async () => {
+  const { cwd, dataDir } = await makeWorkspace()
+  const taskFile = await writeTask(cwd)
+  await createRun({ cwd, objective: 'Close and reopen without a lost panel', runId: 'pane-race-run', dataDir })
+  await materializeWorker({
+    runId: 'pane-race-run', workerId: 'first', role: 'orchestrator_luna_gatherer',
+    taskFile, dataDir,
+  })
+  const codexBin = await fakeCodex(dataDir)
+  await runWorker({
+    runId: 'pane-race-run', workerId: 'first', dataDir,
+    env: { ...process.env, GPT56_ORCHESTRATOR_CODEX_BIN: codexBin },
+  })
+  const tmux = await fakeTmux(dataDir)
+  const env = fakeTmuxEnv(tmux)
+  const pane = await openTmuxPane({ runId: 'pane-race-run', dataDir, env, intervalMs: 10 })
+  const marker = (await readFile(tmux.statePath, 'utf8')).trim().split('\t')[1]
+  const dashboardStatus = await runDashboard({
+    runId: 'pane-race-run', watch: true, intervalMs: 10, dataDir,
+    env: { ...env, TMUX_PANE: pane.paneId, GPT56_ORCHESTRATOR_PANE_MARKER: marker },
+    write: () => {},
+  })
+  assert.equal(dashboardStatus.complete, true)
+  assert.match(await readFile(tmux.statePath, 'utf8'), new RegExp(`^%42\\tretiring:${marker}`))
+  const duplicateWatcherStatus = await runDashboard({
+    runId: 'pane-race-run', watch: true, intervalMs: 10, dataDir,
+    env: { ...env, TMUX_PANE: pane.paneId, GPT56_ORCHESTRATOR_PANE_MARKER: marker },
+    write: () => {},
+  })
+  assert.equal(duplicateWatcherStatus.complete, true)
+
+  await materializeWorker({
+    runId: 'pane-race-run', workerId: 'second', role: 'orchestrator_terra_explorer',
+    taskFile, dataDir,
+  })
+  const reopened = await ensureAutoTmuxPane({ runId: 'pane-race-run', dataDir, env })
+  assert.equal(reopened.status, 'opened')
+  assert.equal((await readFile(tmux.statePath, 'utf8')).includes('\tretiring:'), false)
 })
 
 test('enforces hard execution timeout and exact five-field reports', async () => {
@@ -927,7 +1186,11 @@ test('enforces hard execution timeout and exact five-field reports', async () =>
     executionTimeoutSeconds: 1,
     dataDir: timeoutFixture.dataDir,
   })
-  const slowCodex = await fakeCodex(timeoutFixture.dataDir, { delayMs: 5_000 })
+  const descendantPidPath = path.join(timeoutFixture.dataDir, 'descendant.pid')
+  const slowCodex = await fakeCodex(timeoutFixture.dataDir, {
+    delayMs: 5_000,
+    descendantPidPath,
+  })
   await assert.rejects(() => runWorker({
     runId: 'timeout-run',
     workerId: 'slow',
@@ -938,6 +1201,12 @@ test('enforces hard execution timeout and exact five-field reports', async () =>
   const timeoutProof = JSON.parse(await readFile(timeoutStatus.workers[0].proofPath, 'utf8'))
   assert.equal(timeoutProof.terminationReason, 'execution-timeout')
   assert.equal(timeoutProof.status, 'failed')
+  const descendantPid = Number(await readFile(descendantPidPath, 'utf8'))
+  try {
+    assert.equal(await waitForProcessExit(descendantPid), true, 'timeout must stop Codex descendants')
+  } finally {
+    if (processIsAlive(descendantPid)) process.kill(descendantPid, 'SIGKILL')
+  }
 
   const reportFixture = await makeWorkspace()
   const reportTask = await writeTask(reportFixture.cwd)

@@ -21,7 +21,7 @@ async function read(relativePath) {
 test('manifest exposes the canonical GPT-5.6 Orchestrator identity', async () => {
   const manifest = JSON.parse(await read('.codex-plugin/plugin.json'))
   assert.equal(manifest.name, 'gpt-5-6-orchestrator')
-  assert.match(manifest.version, /^0\.3\.4(?:\+codex\.\d{14})?$/)
+  assert.match(manifest.version, /^0\.3\.5(?:\+codex\.\d{14})?$/)
   assert.equal(manifest.skills, './skills/')
   assert.equal(manifest.interface.displayName, 'GPT-5.6 Orchestrator')
   assert.deepEqual(manifest.interface.capabilities, ['Interactive', 'Read', 'Write'])

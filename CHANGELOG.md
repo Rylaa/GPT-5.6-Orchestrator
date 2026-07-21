@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.5 - 2026-07-21
+
+- Keep watched narrow panels focused on active agents, preserve their task/current-work context, and wrap CJK or emoji text by real terminal-cell width.
+- Bound every tmux helper command by time and output size so an unhealthy tmux server cannot block Codex worker launch.
+- Retire dashboard pane markers atomically with worker creation, including instant-completion handshakes, so later work always reopens a live panel.
+- Publish authenticated heartbeats before `running`, close early-stop signal races, and terminate the full Codex worker process group on stop or timeout.
+- Redact multi-part Bearer and Basic credentials from objectives, task summaries, and live activity before rendering.
+
 ## 0.3.4 - 2026-07-21
 
 - Add an Oh My Codex-inspired high-contrast ANSI palette to the right-side tmux panel, with distinct controller, model, state, activity, report, and metadata tones.
