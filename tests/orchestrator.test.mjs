@@ -21,6 +21,7 @@ import {
   buildCodexArguments,
   buildPaneDashboardCommand,
   createRun,
+  dashboardColorEnabled,
   defaultDataDir,
   ensureAutoTmuxPane,
   getRunStatus,
@@ -38,6 +39,11 @@ import {
 } from '../scripts/orchestrator.mjs'
 
 const execFileAsync = promisify(execFile)
+const ANSI_SEQUENCE_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g
+
+function stripAnsi(value) {
+  return String(value).replace(ANSI_SEQUENCE_RE, '')
+}
 
 async function makeWorkspace() {
   const cwd = await mkdtemp(path.join(os.tmpdir(), 'g56o-workspace-'))
@@ -673,7 +679,9 @@ test('renders a novice-readable live agent panel and opens it only from an attac
     }],
   }, { width: 32 })
   assert.equal(narrow.split('\n').every((line) => [...line].length <= 32), true)
-  assert.match(buildPaneDashboardCommand({ runId: 'dashboard-run', intervalMs: 25 }), /'dashboard-run'/)
+  const paneCommand = buildPaneDashboardCommand({ runId: 'dashboard-run', intervalMs: 25 })
+  assert.match(paneCommand, /'dashboard-run'/)
+  assert.match(paneCommand, /'GPT56_ORCHESTRATOR_COLOR=1'/)
   await assert.rejects(() => openTmuxPane({ runId: 'dashboard-run', env: {} }), /existing tmux client/i)
 
   const root = await mkdtemp(path.join(os.tmpdir(), 'g56o-tmux-'))
@@ -696,6 +704,115 @@ test('renders a novice-readable live agent panel and opens it only from an attac
   await unlink(tmux.statePath)
   const reopened = await ensureAutoTmuxPane({ runId: 'dashboard-run', dataDir: root, env })
   assert.equal(reopened.status, 'opened')
+})
+
+test('live agent panel applies an Oh My Codex-style palette without breaking visible width', () => {
+  const rendered = renderDashboard({
+    runId: 'color-run', objective: 'Render a readable colored agent team',
+    controller: { model: 'gpt-5.6-sol', effort: 'max', authority: 'main-session' },
+    workerBackend: 'codex-exec-background', complete: false, successful: false,
+    counts: { running: 1, queued: 1, completed: 1, failed: 1 },
+    workers: [
+      {
+        workerId: 'luna-running', status: 'running', model: 'gpt-5.6-luna', effort: 'max',
+        sandbox: 'read-only', lane: 'focused evidence gathering', taskSummary: 'Collect focused evidence.',
+        reportPath: '/private/luna/report.md', elapsedMs: 2_000,
+        activity: { summary: 'Reading source files', recent: [{ state: 'running', summary: 'Reading the current implementation' }] },
+      },
+      {
+        workerId: 'terra-done', status: 'completed', model: 'gpt-5.6-terra', effort: 'max',
+        sandbox: 'read-only', lane: 'repository investigation', taskSummary: 'Trace the runtime path.',
+        reportPath: '/private/terra/report.md', elapsedMs: 4_000,
+        activity: { recent: [{ state: 'completed', summary: 'Repository inspection finished' }] },
+      },
+      {
+        workerId: 'sol-waiting', status: 'queued', model: 'gpt-5.6-sol', effort: 'max',
+        sandbox: 'workspace-write', lane: 'critical implementation', taskSummary: 'Wait for the approved write lane.',
+        reportPath: '/private/sol/report.md',
+      },
+      {
+        workerId: 'unsafe\x1b[2Jagent', status: 'failed', model: 'unknown-model', effort: 'max',
+        sandbox: 'read-only', lane: 'failure inspection', taskSummary: 'Inspect failure evidence.',
+        reportPath: '/private/failed/report.md', elapsedMs: 8_000,
+        activity: { recent: [{ state: 'failed', summary: 'Project checks failed' }, { state: 'info', summary: 'Agent shared a safe update' }] },
+      },
+    ],
+  }, { width: 48, color: true })
+
+  assert.match(rendered, /\x1b\[1m\x1b\[36mGPT-5\.6 AGENT TEAM/)
+  assert.match(rendered, /\x1b\[36mGPT-5\.6 Luna/)
+  assert.match(rendered, /\x1b\[33mGPT-5\.6 Terra/)
+  assert.match(rendered, /\x1b\[35mGPT-5\.6 Sol/)
+  assert.match(rendered, /\x1b\[1m\x1b\[36m\[1\/4] luna-running/)
+  assert.match(rendered, /\x1b\[1m\x1b\[32m\[2\/4] terra-done/)
+  assert.match(rendered, /\x1b\[1m\x1b\[33m\[3\/4] sol-waiting/)
+  assert.match(rendered, /\x1b\[1m\x1b\[31m\[4\/4] unsafe agent/)
+  assert.doesNotMatch(rendered, /\x1b\[2Jagent/)
+  assert.equal(stripAnsi(rendered).split('\n').every((line) => [...line].length <= 48), true)
+
+  const plain = renderDashboard({
+    runId: 'plain-run', objective: 'Keep non-interactive output plain',
+    controller: { model: 'gpt-5.6-sol', effort: 'max', authority: 'main-session' },
+    counts: {}, workers: [], complete: false,
+  }, { width: 48, color: false })
+  assert.doesNotMatch(plain, ANSI_SEQUENCE_RE)
+})
+
+test('live agent panel adapts to narrow pane height while keeping the whole team visible', () => {
+  const workers = [
+    ['luna-reader', 'running', 'gpt-5.6-luna'],
+    ['terra-auditor', 'completed', 'gpt-5.6-terra'],
+    ['sol-builder', 'queued', 'gpt-5.6-sol'],
+    ['terra-reviewer', 'failed', 'gpt-5.6-terra'],
+  ].map(([workerId, status, model], index) => ({
+    workerId,
+    status,
+    model,
+    effort: 'max',
+    sandbox: index === 2 ? 'workspace-write' : 'read-only',
+    lane: 'bounded repository work',
+    taskSummary: `Understand and verify task ${index + 1} without overflowing the pane.`,
+    reportPath: `/private/${workerId}/report.md`,
+    elapsedMs: index * 1_000,
+    activity: {
+      summary: `Working on a clearly explained step for task ${index + 1}`,
+      recent: [{ state: status, summary: `Recorded useful progress for task ${index + 1}` }],
+    },
+  }))
+  const rendered = renderDashboard({
+    runId: 'height-aware-run',
+    objective: 'Keep every active agent understandable in a small right-side tmux pane',
+    controller: { model: 'gpt-5.6-sol', effort: 'max', authority: 'main-session' },
+    complete: false,
+    counts: { running: 1, completed: 1, queued: 1, failed: 1 },
+    workers,
+  }, { width: 31, height: 24, color: true })
+  const plain = stripAnsi(rendered)
+  const lines = plain.split('\n')
+
+  assert.equal(lines.length <= 24, true)
+  assert.equal(lines.every((line) => [...line].length <= 31), true)
+  for (const worker of workers) assert.match(plain, new RegExp(worker.workerId))
+  assert.match(plain, /RUNNING/)
+  assert.match(plain, /DONE/)
+  assert.match(plain, /WAITING/)
+  assert.match(plain, /FAILED/)
+  assert.match(rendered, /\x1b\[36mGPT-5\.6 Luna/)
+  assert.match(rendered, /\x1b\[33mGPT-5\.6 Terra/)
+  assert.match(rendered, /\x1b\[35mGPT-5\.6 Sol/)
+})
+
+test('dashboard color detection honors tmux forcing, NO_COLOR, and non-interactive output', () => {
+  assert.equal(dashboardColorEnabled({ env: {}, isTTY: false }), false)
+  assert.equal(dashboardColorEnabled({ env: { TERM: 'xterm-256color' }, isTTY: true }), true)
+  assert.equal(dashboardColorEnabled({ env: { TERM: 'dumb' }, isTTY: true }), false)
+  assert.equal(dashboardColorEnabled({ env: { GPT56_ORCHESTRATOR_COLOR: '1' }, isTTY: false }), true)
+  assert.equal(dashboardColorEnabled({ env: { GPT56_ORCHESTRATOR_COLOR: '0' }, isTTY: true }), false)
+  assert.equal(dashboardColorEnabled({ env: { NO_COLOR: '' }, isTTY: true }), false)
+  assert.equal(dashboardColorEnabled({ env: { GPT56_ORCHESTRATOR_COLOR: '1', NO_COLOR: '' }, isTTY: true }), true)
+  assert.match(buildPaneDashboardCommand({
+    runId: 'no-color-pane', color: false,
+  }), /'GPT56_ORCHESTRATOR_COLOR=0'/)
 })
 
 test('live agent panel explains queued, completed, failed, and multiple-worker states', () => {
@@ -949,6 +1066,11 @@ test('reconciles abandoned queued workers and auto-exits completed dashboards', 
   })
   assert.equal(dashboardStatus.complete, true)
   assert.match(writes.join(''), /turn completed/i)
+  assert.equal(writes[0], '\x1b[?25l')
+  assert.equal(writes[1], '\x1b[2J\x1b[H')
+  assert.equal(writes.at(-1), '\x1b[?25h')
+  assert.match(writes.join(''), /\x1b\[2K/)
+  assert.match(writes.join(''), /\x1b\[J/)
 })
 
 test('prune is dry-run first and moves only old terminal runs to recoverable trash', async () => {

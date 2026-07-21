@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.4 - 2026-07-21
+
+- Add an Oh My Codex-inspired high-contrast ANSI palette to the right-side tmux panel, with distinct controller, model, state, activity, report, and metadata tones.
+- Enable color automatically for tmux/interactive terminals, overriding Codex's inherited `NO_COLOR` only for the automatic pane; `GPT56_ORCHESTRATOR_COLOR=0` remains an explicit opt-out.
+- Use stable cursor-preserving watch redraws with per-row erasure to prevent stale text, reduce flicker, and keep color rendering consistent.
+- Adapt agent cards to the live pane height and width so narrow panes do not scroll into corrupted or unreadable redraws.
+
 ## 0.3.3 - 2026-07-21
 
 - Keep all hook events working when a plugin upgrade prunes the version directory captured by an already-running Codex session.

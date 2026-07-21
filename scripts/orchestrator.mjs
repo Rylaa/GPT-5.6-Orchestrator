@@ -75,6 +75,18 @@ const CONTROLLER_LOCK_STALE_MS = 30_000
 const TMUX_PANE_MARKER_OPTION = '@gpt56_orchestrator_run'
 const TMUX_PANE_TITLE = 'GPT-5.6 agents'
 const AUTO_PANE_DISABLED_VALUES = new Set(['0', 'false', 'no', 'off'])
+const DASHBOARD_COLOR_ENABLED_VALUES = new Set(['1', 'true', 'yes', 'on', 'always'])
+const DASHBOARD_COLOR_DISABLED_VALUES = new Set([...AUTO_PANE_DISABLED_VALUES, 'never'])
+const DASHBOARD_ANSI = Object.freeze({
+  reset: '\x1b[0m',
+  bold: '\x1b[1m',
+  dim: '\x1b[2m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  magenta: '\x1b[35m',
+  cyan: '\x1b[36m',
+})
 const CONTROLLER_CONTRACT = Object.freeze({
   model: 'gpt-5.6-sol',
   authority: 'main-session',
@@ -1298,10 +1310,49 @@ const DASHBOARD_ACTIVITY_MARKERS = Object.freeze({
   info: '•',
 })
 
+const DASHBOARD_STATUS_TONES = Object.freeze({
+  queued: 'yellow',
+  running: 'cyan',
+  completed: 'green',
+  failed: 'red',
+  stopped: 'yellow',
+})
+
+export function dashboardColorEnabled({
+  env = process.env,
+  isTTY = Boolean(process.stdout.isTTY),
+} = {}) {
+  const setting = String(env.GPT56_ORCHESTRATOR_COLOR ?? '').trim().toLowerCase()
+  if (DASHBOARD_COLOR_DISABLED_VALUES.has(setting)) return false
+  if (DASHBOARD_COLOR_ENABLED_VALUES.has(setting)) return true
+  if (Object.prototype.hasOwnProperty.call(env, 'NO_COLOR')) return false
+  return isTTY && String(env.TERM || '').toLowerCase() !== 'dumb'
+}
+
+function dashboardTone(value, tones, enabled) {
+  if (!enabled || !tones) return value
+  const selected = (Array.isArray(tones) ? tones : [tones])
+    .map((tone) => DASHBOARD_ANSI[tone])
+    .filter(Boolean)
+  return selected.length ? `${selected.join('')}${value}${DASHBOARD_ANSI.reset}` : value
+}
+
+function dashboardStatusTone(status) {
+  return DASHBOARD_STATUS_TONES[status] || 'dim'
+}
+
+function dashboardModelTone(worker) {
+  const model = String(worker.model || '')
+  if (model.includes('sol')) return 'magenta'
+  if (model.includes('terra')) return 'yellow'
+  if (model.includes('luna')) return 'cyan'
+  return null
+}
+
 function dashboardWidth(value) {
   const width = Number(value)
   if (!Number.isFinite(width)) return 100
-  return Math.max(32, Math.min(160, Math.floor(width)))
+  return Math.max(16, Math.min(160, Math.floor(width)))
 }
 
 function dashboardElapsed(value) {
@@ -1311,7 +1362,7 @@ function dashboardElapsed(value) {
   return minutes ? `${minutes}m${String(seconds % 60).padStart(2, '0')}s` : `${seconds}s`
 }
 
-function wrapDashboardText(value, width) {
+function wrapDashboardText(value, width, { maxLines = Infinity } = {}) {
   const normalized = sanitizeActivityText(value, 600) || '-'
   const words = normalized.split(' ')
   const lines = []
@@ -1335,14 +1386,27 @@ function wrapDashboardText(value, width) {
     }
   }
   if (current) lines.push(current)
-  return lines.length ? lines : ['-']
+  const wrapped = lines.length ? lines : ['-']
+  if (!Number.isFinite(maxLines) || wrapped.length <= maxLines) return wrapped
+  const limited = wrapped.slice(0, Math.max(1, Math.floor(maxLines)))
+  const lastIndex = limited.length - 1
+  const last = limited[lastIndex]
+  limited[lastIndex] = last.length >= width
+    ? `${last.slice(0, Math.max(0, width - 1))}…`
+    : `${last}…`
+  return limited
 }
 
-function dashboardField(label, value, width, labelWidth = 12) {
+function dashboardField(label, value, width, labelWidth = 12, {
+  color = false,
+  labelTone = ['bold', 'cyan'],
+  valueTone = null,
+  maxLines = Infinity,
+} = {}) {
   const prefix = `${label}:`.padEnd(labelWidth)
-  const available = Math.max(20, width - prefix.length)
-  return wrapDashboardText(value, available).map((line, index) => (
-    `${index === 0 ? prefix : ' '.repeat(prefix.length)}${line}`
+  const available = Math.max(4, width - prefix.length)
+  return wrapDashboardText(value, available, { maxLines }).map((line, index) => (
+    `${index === 0 ? dashboardTone(prefix, labelTone, color) : ' '.repeat(prefix.length)}${dashboardTone(line, valueTone, color)}`
   ))
 }
 
@@ -1361,42 +1425,75 @@ function currentWorkerActivity(worker) {
   return worker.activity?.summary || 'Starting up and reading the assigned task'
 }
 
-function dashboardActivityLines(worker, width) {
-  const recent = Array.isArray(worker.activity?.recent) ? worker.activity.recent.slice(-5) : []
+function dashboardActivityLines(worker, width, { color = false, maxItems = 2 } = {}) {
+  const recent = Array.isArray(worker.activity?.recent) ? worker.activity.recent.slice(-maxItems) : []
   if (recent.length === 0) {
     const prefix = '  · '
-    return wrapDashboardText('No tool activity recorded yet', Math.max(20, width - prefix.length))
-      .map((line, index) => `${index === 0 ? prefix : ' '.repeat(prefix.length)}${line}`)
+    return wrapDashboardText('No tool activity recorded yet', Math.max(4, width - prefix.length))
+      .map((line, index) => dashboardTone(
+        `${index === 0 ? prefix : ' '.repeat(prefix.length)}${line}`,
+        'dim',
+        color,
+      ))
   }
   const lines = []
   for (const activity of recent) {
     const marker = DASHBOARD_ACTIVITY_MARKERS[activity.state] || '·'
-    const prefix = `  ${marker} `
-    const available = Math.max(20, width - prefix.length)
-    const wrapped = wrapDashboardText(activity.summary, available)
-    lines.push(...wrapped.map((line, index) => `${index === 0 ? prefix : ' '.repeat(prefix.length)}${line}`))
+    const markerTone = dashboardStatusTone(activity.state)
+    const plainPrefix = `  ${marker} `
+    const styledPrefix = `  ${dashboardTone(marker, ['bold', markerTone], color)} `
+    const available = Math.max(4, width - plainPrefix.length)
+    const wrapped = wrapDashboardText(activity.summary, available, { maxLines: 1 })
+    lines.push(...wrapped.map((line, index) => `${index === 0 ? styledPrefix : ' '.repeat(plainPrefix.length)}${line}`))
   }
   return lines
 }
 
-export function renderDashboard(status, { width = 100 } = {}) {
+export function renderDashboard(status, { width = 100, height, color = false } = {}) {
   const columns = dashboardWidth(width)
-  const divider = '─'.repeat(columns)
+  const maxHeight = Number.isFinite(Number(height)) && Number(height) > 0
+    ? Math.max(8, Math.floor(Number(height)))
+    : null
+  const cap = (value) => maxHeight ? value : Infinity
+  const divider = dashboardTone('─'.repeat(columns), ['dim', 'cyan'], color)
   const workers = Array.isArray(status.workers) ? status.workers : []
   const counts = ['running', 'queued', 'completed', 'failed', 'stopped']
     .filter((state) => Number(status.counts?.[state]) > 0)
     .map((state) => `${status.counts[state]} ${state}`)
     .join(' · ') || 'no agents yet'
-  const output = [
-    'GPT-5.6 AGENT TEAM — LIVE WORK',
-    ...dashboardField('Run', status.runId, columns),
-    ...dashboardField('Goal', status.objective, columns),
-    ...dashboardField('Progress', counts, columns),
-    ...dashboardField('Controller', `Sol · ${status.controller.effort} reasoning · main-session authority`, columns),
+  const title = wrapDashboardText('GPT-5.6 AGENT TEAM — LIVE WORK', columns, { maxLines: cap(2) })
+    .map((line) => dashboardTone(line, ['bold', 'cyan'], color))
+  const header = [
+    ...title,
+    ...dashboardField('Run', status.runId, columns, 12, { color, valueTone: 'dim', maxLines: cap(1) }),
+    ...dashboardField('Goal', status.objective, columns, 12, { color, maxLines: cap(2) }),
+    ...dashboardField('Progress', counts, columns, 12, {
+      color,
+      maxLines: cap(1),
+      valueTone: status.complete ? 'green' : Number(status.counts?.failed) > 0 ? 'red' : Number(status.counts?.running) > 0 ? 'cyan' : 'yellow',
+    }),
+    ...dashboardField(
+      'Controller',
+      maxHeight ? `Sol · ${status.controller.effort}` : `Sol · ${status.controller.effort} reasoning · main-session authority`,
+      columns,
+      12,
+      { color, valueTone: 'magenta', maxLines: cap(1) },
+    ),
   ]
 
+  const fullSections = []
+  const compactSections = []
+  const minimalSections = []
+
   if (workers.length === 0) {
-    output.push(divider, ...wrapDashboardText('No agents have been started for this run.', columns))
+    const emptySection = [
+      divider,
+      ...wrapDashboardText('No agents have been started for this run.', columns, { maxLines: cap(2) })
+        .map((line) => dashboardTone(line, 'yellow', color)),
+    ]
+    fullSections.push(emptySection)
+    compactSections.push(emptySection)
+    minimalSections.push(emptySection)
   }
 
   workers.forEach((worker, index) => {
@@ -1410,21 +1507,86 @@ export function renderDashboard(status, { width = 100 } = {}) {
         ? `Not accepted: ${reportName}`
         : `Pending: ${reportName}`
     const workerHeading = `[${index + 1}/${workers.length}] ${sanitizeActivityText(worker.workerId, 80) || 'agent'}  ·  ${statusLabel}  ·  ${dashboardElapsed(worker.elapsedMs)}`
-    output.push(
+    const statusTone = dashboardStatusTone(worker.status)
+    const heading = wrapDashboardText(workerHeading, columns, { maxLines: cap(1) })
+      .map((line) => dashboardTone(line, ['bold', statusTone], color))
+    const reportField = dashboardField('Report', reportState, columns, 12, {
+      color,
+      valueTone: statusTone,
+      maxLines: cap(1),
+    })
+    fullSections.push([
       divider,
-      ...wrapDashboardText(workerHeading, columns),
-      ...dashboardField('Agent', dashboardModel(worker), columns),
-      ...dashboardField('Role', lane, columns),
-      ...dashboardField('Task', task, columns),
-      ...dashboardField('Now', currentWorkerActivity(worker), columns),
-      'Recent work:',
-      ...dashboardActivityLines(worker, columns),
-    )
-    if (worker.owns?.length) output.push(...dashboardField('Owns', worker.owns.join(', '), columns))
-    output.push(...dashboardField('Report', reportState, columns))
+      ...heading,
+      ...dashboardField('Agent', dashboardModel(worker), columns, 12, {
+        color,
+        valueTone: dashboardModelTone(worker),
+        maxLines: cap(2),
+      }),
+      ...dashboardField('Role', lane, columns, 12, { color, maxLines: cap(1) }),
+      ...dashboardField('Task', task, columns, 12, { color, maxLines: cap(3) }),
+      ...dashboardField('Now', currentWorkerActivity(worker), columns, 12, {
+        color,
+        valueTone: statusTone,
+        maxLines: cap(2),
+      }),
+      dashboardTone('Recent work:', ['bold', 'magenta'], color),
+      ...dashboardActivityLines(worker, columns, { color, maxItems: maxHeight ? 2 : 5 }),
+    ])
+    if (worker.owns?.length) {
+      fullSections.at(-1).push(...dashboardField('Owns', worker.owns.join(', '), columns, 12, {
+        color,
+        valueTone: 'dim',
+        maxLines: cap(1),
+      }))
+    }
+    fullSections.at(-1).push(...reportField)
+    compactSections.push([
+      divider,
+      ...heading,
+      ...dashboardField('Agent', dashboardModel(worker), columns, 12, {
+        color,
+        valueTone: dashboardModelTone(worker),
+        maxLines: 1,
+      }),
+      ...dashboardField('Now', currentWorkerActivity(worker), columns, 12, {
+        color,
+        valueTone: statusTone,
+        maxLines: 1,
+      }),
+      ...reportField,
+    ])
+    minimalSections.push([divider, ...heading])
   })
 
-  output.push(divider, ...wrapDashboardText('Updates automatically. The pane closes when every agent reaches a terminal state.', columns))
+  const footer = [
+    divider,
+    ...wrapDashboardText(
+      maxHeight ? 'Auto-updates · closes when agents finish' : 'Updates automatically. The pane closes when every agent reaches a terminal state.',
+      columns,
+      { maxLines: cap(1) },
+    )
+      .map((line) => dashboardTone(line, 'dim', color)),
+  ]
+  const compose = (start, sections) => [...start, ...sections.flat(), ...footer]
+  let output = compose(header, fullSections)
+  if (maxHeight && output.length > maxHeight) output = compose(header, compactSections)
+  if (maxHeight && output.length > maxHeight) {
+    const minimalHeader = [...title, ...dashboardField('Progress', counts, columns, 12, {
+      color,
+      maxLines: 1,
+      valueTone: status.complete ? 'green' : Number(status.counts?.failed) > 0 ? 'red' : 'cyan',
+    })]
+    output = compose(minimalHeader, compactSections)
+    if (output.length > maxHeight) output = compose(minimalHeader, minimalSections)
+  }
+  if (maxHeight && output.length > maxHeight) {
+    const hidden = output.length - maxHeight + 1
+    output = [
+      ...output.slice(0, Math.max(1, maxHeight - 1)),
+      dashboardTone(`… ${hidden} more lines`, ['dim', 'yellow'], color),
+    ]
+  }
   return output.join('\n')
 }
 
@@ -1451,16 +1613,45 @@ export async function runDashboard({
   intervalMs = 1000,
   dataDir = defaultDataDir(),
   write = (value) => process.stdout.write(value),
+  color,
+  env = process.env,
+  isTTY = Boolean(process.stdout.isTTY),
 }) {
   const normalizedInterval = normalizeIntervalMs(intervalMs)
-  do {
-    const status = await getRunStatus({ runId, dataDir })
-    if (watch) write('\x1Bc')
-    write(`${renderDashboard(status, { width: process.stdout.columns })}\n`)
-    if (!watch || (status.complete && !keepOpen)) return status
-    await delay(normalizedInterval)
-  } while (watch)
-  return null
+  const useColor = typeof color === 'boolean' ? color : dashboardColorEnabled({ env, isTTY })
+  let firstRender = true
+  if (watch) write('\x1b[?25l')
+  try {
+    do {
+      const status = await getRunStatus({ runId, dataDir })
+      if (watch) write(firstRender ? '\x1b[2J\x1b[H' : '\x1b[H')
+      firstRender = false
+      const rendered = renderDashboard(status, {
+        // A line that fills the terminal's last column can implicitly wrap before
+        // the following newline. Reserve one column so repeated tmux redraws stay
+        // anchored instead of scrolling and merging old text into the new frame.
+        width: Number.isFinite(Number(process.stdout.columns))
+          ? Math.max(16, Number(process.stdout.columns) - 1)
+          : process.stdout.columns,
+        height: process.stdout.rows,
+        color: useColor,
+      })
+      if (watch) {
+        // Clearing each reused row prevents shorter status text from leaving a
+        // suffix behind from the previous frame. Do not append a newline here:
+        // erase-to-screen-end starts exactly after the final rendered character.
+        write(rendered.split('\n').map((line) => `\x1b[2K${line}`).join('\n'))
+        write('\x1b[J')
+      } else {
+        write(`${rendered}\n`)
+      }
+      if (!watch || (status.complete && !keepOpen)) return status
+      await delay(normalizedInterval)
+    } while (watch)
+    return null
+  } finally {
+    if (watch) write('\x1b[?25h')
+  }
 }
 
 function shellQuote(value) {
@@ -1472,12 +1663,13 @@ export function buildPaneDashboardCommand({
   intervalMs = 1000,
   nodeBin = process.execPath,
   dataDir = null,
+  color = true,
 }) {
   const normalizedRunId = assertIdentifier(runId, 'run id')
   const normalizedInterval = normalizeIntervalMs(intervalMs)
-  const command = dataDir
-    ? ['env', `GPT56_ORCHESTRATOR_DATA_DIR=${path.resolve(dataDir)}`, nodeBin]
-    : [nodeBin]
+  const command = ['env', `GPT56_ORCHESTRATOR_COLOR=${color ? '1' : '0'}`]
+  if (dataDir) command.push(`GPT56_ORCHESTRATOR_DATA_DIR=${path.resolve(dataDir)}`)
+  command.push(nodeBin)
   return [...command, SCRIPT_PATH, 'dashboard', '--run', normalizedRunId, '--watch', '--interval-ms', normalizedInterval]
     .map(shellQuote)
     .join(' ')
@@ -1545,6 +1737,9 @@ export async function openTmuxPane({
     intervalMs: normalizedInterval,
     nodeBin: env.GPT56_ORCHESTRATOR_NODE_BIN || process.execPath,
     dataDir: resolvedDataDir,
+    color: !DASHBOARD_COLOR_DISABLED_VALUES.has(
+      String(env.GPT56_ORCHESTRATOR_COLOR ?? '').trim().toLowerCase(),
+    ),
   })
   const splitArgs = ['split-window']
   if (env.TMUX_PANE) splitArgs.push('-t', env.TMUX_PANE)
@@ -1720,8 +1915,9 @@ function printHelp() {
     '',
     `Roles: ${MANAGED_AGENT_TYPES.join(', ')}`,
     '',
-    'Tmux: spawn automatically opens one right-side live-work panel with human-readable agent tasks and recent activity; it closes when the run is terminal.',
+    'Tmux: spawn automatically opens one color-coded right-side live-work panel with human-readable agent tasks and recent activity; it closes when the run is terminal.',
     'Set GPT56_ORCHESTRATOR_AUTO_PANE=0 to disable automatic panes; pane --run remains available for recovery.',
+    'Set GPT56_ORCHESTRATOR_COLOR=0 to disable automatic-pane colors; ordinary dashboard output also honors NO_COLOR.',
   ].join('\n') + '\n')
 }
 

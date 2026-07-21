@@ -113,6 +113,15 @@ activity reopens it. Set
 `GPT56_ORCHESTRATOR_AUTO_PANE=0` to opt out. `pane --run <id>`
 remains a manual recovery command. This is not a native Codex sidebar.
 
+The panel uses an [Oh My Codex](https://github.com/Yeachan-Heo/oh-my-codex)-inspired
+basic ANSI palette: cyan structure, magenta Sol authority, model-specific agent
+tones, and green/yellow/red lifecycle states. It also compacts cards to the live
+pane dimensions so every agent stays visible without redraw corruption. Color
+turns on automatically in tmux and interactive terminals. Ordinary dashboard
+output honors `NO_COLOR`; the automatic pane intentionally overrides the
+`NO_COLOR=1` inherited from Codex. Set `GPT56_ORCHESTRATOR_COLOR=0` to make that
+pane plain. The plugin-specific setting always wins; OMX is not a dependency.
+
 Write workers require `--allow-write --owns <path[,path]>` and a Git worktree.
 Only one writer may run in a Git workspace across all runs; use separate worktrees
 for parallel writers. A post-run Git-visible plus workflow-contract snapshot rejects
